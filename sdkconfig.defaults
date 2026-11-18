@@ -1,0 +1,6 @@
+# XIAO ESP32-C6 的 USB-C 接的是晶片內建的 USB Serial/JTAG，
+# 把主控台（printf / ESP_LOG）直接導到這個埠，monitor 才看得到輸出。
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# XIAO ESP32-C6 板載 4MB Flash
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
