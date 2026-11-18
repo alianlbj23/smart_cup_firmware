@@ -1,5 +1,5 @@
 /*
- * smart_cup_test — 硬體接線測試
+ * smart_cup_firmware — 接線測試、水位與姿態量測、BLE 推送
  *
  * 硬體：Seeed Studio XIAO ESP32-C6
  *       + MPR121 電容感測模組（HW-017，I2C 0x5A）
@@ -8,10 +8,12 @@
  *
  * 開機後全自動執行，不需要從 monitor 輸入任何東西：
  *   第一部分：每個項目自動測一次，最後印出總結表（通過／失敗，失敗時列出該檢查的線）
- *   第二部分：進入即時顯示，每 0.5 秒印一行數值，用手碰電極腳、傾斜板子觀察變化
+ *   第二部分：每 100 ms 讀一次感測器，算水位、姿態，透過 BLE 推送給 App（ble_gatt_svr.c），
+ *             序列埠每 0.5 秒印一行
  *
- * 這一步只做接線測試，沒有水位計算、BLE、深度睡眠。
- * 依 ESP-IDF v6.1 的 API 撰寫（新版 I2C 驅動 driver/i2c_master.h、esp_adc oneshot + 校正）。
+ * 水位、姿態的計算在 cup_state.c（水位校正值 LEVEL_E0_EMPTY / LEVEL_E0_FULL 也在那裡）。
+ * 還沒有深度睡眠。
+ * 依 ESP-IDF v6.1 的 API 撰寫（新版 I2C 驅動 driver/i2c_master.h、esp_adc oneshot + 校正、NimBLE）。
  */
 
 #include <stdio.h>
@@ -32,6 +34,9 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+
+#include "cup_state.h"
+#include "ble_gatt_svr.h"
 
 /* ========================================================================== */
 /*  腳位（XIAO ESP32-C6 的 Dx 標示 → GPIO 編號）                                */
@@ -64,13 +69,12 @@
 #define BAT_MIN_MV              2800
 #define BAT_MAX_MV              4400
 
-// 水位校正（電極0 的濾波後資料）：水越多讀值越小，兩點之間用直線換算
-// 0.5 µs 充電時實測：空杯 205、半杯 177.5（換算 52.5%）、滿杯 153 → 線性良好
-// 1 µs 充電時實測（2026-11-19）：空杯 403.3（±1）、滿杯 298.0（±3），總變化 105
-#define LEVEL_E0_EMPTY          403     // 空杯時電極0 的讀值
-#define LEVEL_E0_FULL           298     // 滿杯時電極0 的讀值
-
-#define LIVE_PERIOD_MS          500     // 即時顯示每 0.5 秒一行
+// 即時量測的節奏：每 100 ms 讀一次感測器，其他動作是它的倍數
+#define SENSE_PERIOD_MS         100
+#define ATTITUDE_EVERY          2       // 每 200 ms 送一次 ATTITUDE（5 次/秒）
+#define PRINT_EVERY             5       // 每 500 ms 序列埠印一行
+#define WATER_EVERY             10      // 每 1 秒送一次 WATER、POSE（姿態改變時會立刻送 POSE）
+#define BATTERY_EVERY           100     // 每 10 秒量一次電池
 #define LIVE_HEADER_EVERY       20      // 每 20 行重印一次欄位標題
 
 #define RAD_TO_DEG              57.2957795f
@@ -134,6 +138,7 @@
 #define MPU_WHOAMI_9250         0x71
 #define MPU_WHOAMI_6500         0x70
 #define MPU_ACC_LSB_PER_G       16384.0f    // ±2g 量程時 1 g = 16384
+#define MPU_GYRO_LSB_PER_DPS    131.0f      // ±250 度/秒量程時 1 度/秒 = 131
 
 /* ========================================================================== */
 /*  測試結果與總結表                                                            */
@@ -1030,35 +1035,69 @@ static void print_compact_summary(void)
 }
 
 /* ========================================================================== */
-/*  第二部分：即時顯示                                                          */
+/*  第二部分：即時量測、BLE 推送、序列埠顯示                                    */
 /* ========================================================================== */
+// 讀加速度與陀螺儀（0x3B～0x48 一次讀 14 bytes：加速度 XYZ、溫度、陀螺儀 XYZ）
+static bool imu_read_all(float acc[3], float gyro[3])
+{
+    uint8_t d[14];
+    if (reg_read(s_imu_dev, MPU_REG_ACCEL_XOUT_H, d, sizeof(d)) != ESP_OK) {
+        return false;
+    }
+    for (int i = 0; i < 3; i++) {
+        acc[i] = (int16_t)((d[2 * i] << 8) | d[2 * i + 1]) / MPU_ACC_LSB_PER_G;
+        gyro[i] = (int16_t)((d[8 + 2 * i] << 8) | d[8 + 2 * i + 1]) / MPU_GYRO_LSB_PER_DPS;
+    }
+    return true;
+}
+
+// 開機時把「直立靜止」記成姿態零點：取 20 筆平均，傾斜超過 10° 或在晃動就不採用
+static void motion_zero(void)
+{
+    if (!s_imu_ready) {
+        return;
+    }
+    float acc_sum[3] = { 0 }, gyro_sum[3] = { 0 };
+    int n = 0;
+    for (int i = 0; i < 20; i++) {
+        float acc[3], gyro[3];
+        if (imu_read_all(acc, gyro)) {
+            for (int k = 0; k < 3; k++) {
+                acc_sum[k] += acc[k];
+                gyro_sum[k] += gyro[k];
+            }
+            n++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (n == 0) {
+        printf("  姿態零點：讀 IMU 失敗，零點維持 0\n");
+        return;
+    }
+    bool ok = cup_motion_set_zero(acc_sum[0] / n, acc_sum[1] / n, acc_sum[2] / n,
+                                  gyro_sum[0] / n, gyro_sum[1] / n, gyro_sum[2] / n);
+    printf("  姿態零點：%s\n", ok ? "已用開機時的姿態當直立零點"
+                                    : "開機時杯子不是直立靜止，零點維持 0（傾斜角可能有幾度偏差）");
+}
+
 // 欄寬（以終端機顯示寬度計算，中文字算 2 格）
 #define W_TIME   8
 #define W_E      6
 #define W_LEVEL  7
 #define W_TOUCH  7
 #define W_IRQ    6
-#define W_ACC    9
-#define W_TOT    8
-#define W_TILT   9
-#define W_BAT    8
-
-// 電極0 讀值 → 水位 %（兩點直線換算，超出 0～100 的部分截掉）
-static float water_level_pct(uint16_t e0)
-{
-    float pct = (float)(LEVEL_E0_EMPTY - (int)e0) * 100.0f / (float)(LEVEL_E0_EMPTY - LEVEL_E0_FULL);
-    if (pct < 0.0f) {
-        pct = 0.0f;
-    } else if (pct > 100.0f) {
-        pct = 100.0f;
-    }
-    return pct;
-}
+#define W_ANG    7
+#define W_POSE   7
+#define W_MOVE   5
+#define W_BAT    7
+#define W_BLE    7
 
 static void print_live_header(void)
 {
     printf("\n");
     print_compact_summary();
+    printf("BLE 名稱：%s　｜　水位只在直立靜止時更新，「水位%%」後面的 * 代表沿用上一次的值\n",
+           ble_cup_name()[0] ? ble_cup_name() : "（BLE 未啟動）");
     print_col("時間(s)", W_TIME, true);
     print_col("電極0", W_E, true);
     print_col("電極1", W_E, true);
@@ -1066,107 +1105,150 @@ static void print_live_header(void)
     print_col("觸碰", W_TOUCH, true);
     print_col("IRQ數", W_IRQ, true);
     printf(" |");
-    print_col("加速X(g)", W_ACC, true);
-    print_col("加速Y(g)", W_ACC, true);
-    print_col("加速Z(g)", W_ACC, true);
-    print_col("合計(g)", W_TOT, true);
-    print_col("傾斜(度)", W_TILT, true);
+    print_col("俯仰°", W_ANG, true);
+    print_col("翻滾°", W_ANG, true);
+    print_col("傾斜°", W_ANG, true);
+    print_col("姿態", W_POSE, true);
+    print_col("移動", W_MOVE, true);
     printf(" |");
-    print_col("電池(V)", W_BAT, true);
+    print_col("電池V", W_BAT, true);
+    print_col("BLE", W_BLE, true);
     printf("\n");
-    for (int i = 0; i < W_TIME + 2 * W_E + W_LEVEL + W_TOUCH + W_IRQ + 2 + 3 * W_ACC + W_TOT + W_TILT + 2 + W_BAT; i++) {
+    for (int i = 0; i < W_TIME + 2 * W_E + W_LEVEL + W_TOUCH + W_IRQ + 2 + 3 * W_ANG + W_POSE + W_MOVE + 2 + W_BAT + W_BLE; i++) {
         putchar('-');
     }
     putchar('\n');
 }
 
+static const char *ble_state_word(ble_cup_state_t st)
+{
+    switch (st) {
+    case BLE_CUP_ADVERTISING: return "廣播中";
+    case BLE_CUP_CONNECTED:   return "已連線";
+    case BLE_CUP_SUBSCRIBED:  return "傳送中";
+    default:                  return "關閉";
+    }
+}
+
 static void live_loop(void)
 {
-    printf("\n>>> 進入即時顯示（每 0.5 秒一行）：用手碰 MPR121 的 0、1 號電極腳、傾斜板子，觀察數字變化\n");
+    printf("\n>>> 進入即時量測（每 %d ms 讀一次感測器，序列埠每 %d ms 印一行）\n",
+           SENSE_PERIOD_MS, SENSE_PERIOD_MS * PRINT_EVERY);
 
     // 即時顯示時讀取失敗會直接印「--」，不需要驅動再印錯誤訊息把表格打亂
     esp_log_level_set("i2c.master", ESP_LOG_NONE);
 
     s_mpr_irq_count = 0;   // IRQ 次數從即時顯示開始累計
     TickType_t last_wake = xTaskGetTickCount();
-    uint32_t row = 0;
+    uint32_t tick = 0, row = 0;
+    cup_motion_t motion = { .pose = CUP_POSE_UNKNOWN };
+    bool have_motion = false;
+    cup_pose_t last_sent_pose = CUP_POSE_UNKNOWN;
+    bool have_e = false;
+    uint16_t e0 = 0, e1 = 0;
+    int bat_mv = -1;
 
     while (true) {
-        if (row % LIVE_HEADER_EVERY == 0) {
-            print_live_header();
-        }
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-        char f_time[16], f_e0[8] = "--", f_e1[8] = "--", f_level[8] = "--", f_touch[16] = "--", f_irq[12] = "--";
-        char f_ax[16] = "--", f_ay[16] = "--", f_az[16] = "--", f_tot[16] = "--", f_tilt[16] = "--";
-        char f_bat[16] = "--";
-
-        snprintf(f_time, sizeof(f_time), "%.1f", esp_timer_get_time() / 1000000.0);
-
-        // ---- MPR121：濾波後資料（0x04 起）＋觸碰狀態（0x00，讀取同時清除 IRQ）----
-        if (s_mpr_ready) {
-            uint16_t e0, e1;
-            if (mpr121_read_filtered(&e0, &e1)) {
-                snprintf(f_e0, sizeof(f_e0), "%u", e0);
-                snprintf(f_e1, sizeof(f_e1), "%u", e1);
-                snprintf(f_level, sizeof(f_level), "%.0f", water_level_pct(e0));
-            }
-            uint8_t st[2];
-            if (mpr121_read_touch(st)) {
-                bool t0 = st[0] & 0x01;
-                bool t1 = st[0] & 0x02;
-                if (st[1] & 0x80) {
-                    snprintf(f_touch, sizeof(f_touch), "過電流");   // OVCF：REXT 腳異常
-                } else if (t0 && t1) {
-                    snprintf(f_touch, sizeof(f_touch), "E0+E1");
-                } else if (t0) {
-                    snprintf(f_touch, sizeof(f_touch), "E0");
-                } else if (t1) {
-                    snprintf(f_touch, sizeof(f_touch), "E1");
-                } else {
-                    snprintf(f_touch, sizeof(f_touch), "無");
-                }
-            }
-            snprintf(f_irq, sizeof(f_irq), "%" PRIu32, s_mpr_irq_count);
-        }
-
-        // ---- IMU：加速度、合計、傾斜角 ----
+        // ---- 讀感測器 ----
         if (s_imu_ready) {
-            float ax, ay, az;
-            if (imu_read_accel(&ax, &ay, &az)) {
-                float total = sqrtf(ax * ax + ay * ay + az * az);
-                snprintf(f_ax, sizeof(f_ax), "%+.3f", ax);
-                snprintf(f_ay, sizeof(f_ay), "%+.3f", ay);
-                snprintf(f_az, sizeof(f_az), "%+.3f", az);
-                snprintf(f_tot, sizeof(f_tot), "%.3f", total);
-                snprintf(f_tilt, sizeof(f_tilt), "%.1f", tilt_deg(ax, ay, az));
+            float acc[3], gyro[3];
+            if (imu_read_all(acc, gyro)) {
+                cup_motion_update(acc[0], acc[1], acc[2], gyro[0], gyro[1], gyro[2], now_ms, &motion);
+                have_motion = true;
+            }
+        }
+        if (s_mpr_ready) {
+            have_e = mpr121_read_filtered(&e0, &e1);
+            if (have_e) {
+                // 沒有 IMU 時無法判斷姿態，就當作一直是直立靜止
+                cup_water_add_sample(e0, have_motion ? motion.water_ok : true);
+            }
+        }
+        if (tick % BATTERY_EVERY == 0) {
+            int pin_mv;
+            bat_mv = battery_read(&pin_mv, &bat_mv) ? bat_mv : -1;
+            ble_cup_set_battery(bat_mv < 0 ? 0xFF : cup_battery_percent(bat_mv));
+        }
+
+        // ---- BLE 推送 ----
+        if (have_motion && tick % ATTITUDE_EVERY == 0) {
+            ble_cup_send_attitude(motion.pitch_deg, motion.roll_deg);
+        }
+        bool pose_changed = have_motion && motion.pose != last_sent_pose;
+        if (have_motion && (pose_changed || tick % WATER_EVERY == 0)) {
+            ble_cup_send_pose(motion.tilt_deg, (uint8_t)motion.pose, motion.moving);
+            last_sent_pose = motion.pose;
+        }
+        if (tick % WATER_EVERY == 0) {
+            float pct;
+            if (cup_water_get(&pct)) {
+                ble_cup_send_water(pct);
             }
         }
 
-        // ---- 電池 ----
-        int pin_mv, bat_mv;
-        if (battery_read(&pin_mv, &bat_mv)) {
-            snprintf(f_bat, sizeof(f_bat), "%.2f", bat_mv / 1000.0f);
+        // ---- 序列埠顯示 ----
+        if (tick % PRINT_EVERY == 0) {
+            if (row % LIVE_HEADER_EVERY == 0) {
+                print_live_header();
+            }
+            char f_time[16], f_e0[8] = "--", f_e1[8] = "--", f_level[12] = "--", f_touch[16] = "--", f_irq[12] = "--";
+            char f_p[12] = "--", f_r[12] = "--", f_t[12] = "--", f_pose[16] = "--", f_move[12] = "--";
+            char f_bat[12] = "--";
+
+            snprintf(f_time, sizeof(f_time), "%.1f", now_ms / 1000.0);
+            if (s_mpr_ready) {
+                if (have_e) {
+                    snprintf(f_e0, sizeof(f_e0), "%u", e0);
+                    snprintf(f_e1, sizeof(f_e1), "%u", e1);
+                }
+                uint8_t st[2];
+                if (mpr121_read_touch(st)) {   // 讀觸碰狀態同時清除 MPR121 的 IRQ
+                    bool t0 = st[0] & 0x01;
+                    bool t1 = st[0] & 0x02;
+                    snprintf(f_touch, sizeof(f_touch), "%s",
+                             (st[1] & 0x80) ? "過電流" : (t0 && t1) ? "E0+E1" : t0 ? "E0" : t1 ? "E1" : "無");
+                }
+                snprintf(f_irq, sizeof(f_irq), "%" PRIu32, s_mpr_irq_count);
+            }
+            float pct;
+            if (cup_water_get(&pct)) {
+                snprintf(f_level, sizeof(f_level), "%.0f%s", pct, cup_water_holding() ? "*" : "");
+            }
+            if (have_motion) {
+                snprintf(f_p, sizeof(f_p), "%+.1f", motion.pitch_deg);
+                snprintf(f_r, sizeof(f_r), "%+.1f", motion.roll_deg);
+                snprintf(f_t, sizeof(f_t), "%.1f", motion.tilt_deg);
+                snprintf(f_pose, sizeof(f_pose), "%s", cup_pose_label(motion.pose));
+                snprintf(f_move, sizeof(f_move), "%s", motion.moving ? "是" : "否");
+            }
+            if (bat_mv >= 0) {
+                snprintf(f_bat, sizeof(f_bat), "%.2f", bat_mv / 1000.0f);
+            }
+
+            print_col(f_time, W_TIME, true);
+            print_col(f_e0, W_E, true);
+            print_col(f_e1, W_E, true);
+            print_col(f_level, W_LEVEL, true);
+            print_col(f_touch, W_TOUCH, true);
+            print_col(f_irq, W_IRQ, true);
+            printf(" |");
+            print_col(f_p, W_ANG, true);
+            print_col(f_r, W_ANG, true);
+            print_col(f_t, W_ANG, true);
+            print_col(f_pose, W_POSE, true);
+            print_col(f_move, W_MOVE, true);
+            printf(" |");
+            print_col(f_bat, W_BAT, true);
+            print_col(ble_state_word(ble_cup_state()), W_BLE, true);
+            printf("\n");
+            fflush(stdout);
+            row++;
         }
 
-        print_col(f_time, W_TIME, true);
-        print_col(f_e0, W_E, true);
-        print_col(f_e1, W_E, true);
-        print_col(f_level, W_LEVEL, true);
-        print_col(f_touch, W_TOUCH, true);
-        print_col(f_irq, W_IRQ, true);
-        printf(" |");
-        print_col(f_ax, W_ACC, true);
-        print_col(f_ay, W_ACC, true);
-        print_col(f_az, W_ACC, true);
-        print_col(f_tot, W_TOT, true);
-        print_col(f_tilt, W_TILT, true);
-        printf(" |");
-        print_col(f_bat, W_BAT, true);
-        printf("\n");
-        fflush(stdout);
-
-        row++;
-        xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(LIVE_PERIOD_MS));
+        tick++;
+        xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SENSE_PERIOD_MS));
     }
 }
 
@@ -1212,6 +1294,15 @@ void app_main(void)
 
     print_summary();
     printf("  提示：在 monitor 按 Ctrl+T 再按 Ctrl+R 可以重開機，重新跑一次測試\n");
+
+    // 姿態零點：開機時杯子應該直立放在桌上
+    motion_zero();
+
+    // BLE：廣播 SmartCup-XXXX，App 連上並訂閱後開始推送水位、姿態
+    err = ble_cup_init();
+    if (err != ESP_OK) {
+        printf("  BLE 初始化失敗（%s），只有序列埠顯示\n", esp_err_to_name(err));
+    }
 
     live_loop();
 }

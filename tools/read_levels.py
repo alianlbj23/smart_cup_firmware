@@ -47,7 +47,8 @@ def parse(text: str):
     for line in text.splitlines():
         m = ROW_RE.match(line)
         if m and m.group(2) != "--":
-            level = int(m.group(4)) if m.group(4).isdigit() else None
+            lv = m.group(4).rstrip("*")   # 「*」代表傾斜／移動中沿用上一次的水位
+            level = int(lv) if lv.isdigit() else None
             rows.append((float(m.group(1)), int(m.group(2)), int(m.group(3)), level))
     # 只保留最後一次開機之後的資料
     for i in range(len(rows) - 1, 0, -1):

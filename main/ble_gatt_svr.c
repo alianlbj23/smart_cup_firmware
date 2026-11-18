@@ -1,0 +1,396 @@
+#include "ble_gatt_svr.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <inttypes.h>
+#include <math.h>
+#include <time.h>
+#include <sys/time.h>
+
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+
+/* ========================================================================== */
+/*  UUID                                                                        */
+/* ========================================================================== */
+// 3c8b00NN-efc1-4061-946c-e5916790df93，NimBLE 的 128-bit UUID 是 little-endian（倒過來寫），
+// NN 在第 12 個 byte
+#define CUP_UUID(nn) BLE_UUID128_INIT(0x93, 0xdf, 0x90, 0x67, 0x91, 0xe5, 0x6c, 0x94, \
+                                      0x61, 0x40, 0xc1, 0xef, (nn), 0x00, 0x8b, 0x3c)
+
+static const ble_uuid128_t k_svc_uuid    = CUP_UUID(0x01);
+static const ble_uuid128_t k_time_uuid   = CUP_UUID(0x02);
+static const ble_uuid128_t k_data_uuid   = CUP_UUID(0x03);
+static const ble_uuid128_t k_ack_uuid    = CUP_UUID(0x04);
+static const ble_uuid128_t k_status_uuid = CUP_UUID(0x05);
+
+#define MSG_WATER     0x02
+#define MSG_RAW       0x03
+#define MSG_POSE      0x04
+#define MSG_ATTITUDE  0x05
+#define DATA_LEN      9
+#define FILL25_MAX    ((1u << 25) - 1)
+
+// access callback 用 arg 分辨是哪個 characteristic
+enum { CHR_TIME = 1, CHR_DATA, CHR_ACK, CHR_STATUS };
+
+/* ========================================================================== */
+/*  狀態                                                                        */
+/* ========================================================================== */
+static uint16_t s_data_handle, s_status_handle;
+static volatile uint16_t s_conn = BLE_HS_CONN_HANDLE_NONE;
+static volatile bool s_data_sub, s_status_sub;
+static volatile bool s_started;
+static uint8_t s_own_addr_type;
+static char s_name[20];
+static volatile uint8_t s_battery = 0xFF;
+static volatile uint32_t s_notify_count, s_ack_count;
+
+static void advertise(void);
+
+static void put_u32(uint8_t *p, uint32_t v)
+{
+    p[0] = v & 0xFF;
+    p[1] = (v >> 8) & 0xFF;
+    p[2] = (v >> 16) & 0xFF;
+    p[3] = (v >> 24) & 0xFF;
+}
+
+/* ========================================================================== */
+/*  GATT                                                                        */
+/* ========================================================================== */
+static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
+                      struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int which = (int)(intptr_t)arg;
+
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        if (which == CHR_STATUS) {
+            uint8_t st[4] = { s_battery, CUP_FW_MAJOR, CUP_FW_MINOR, CUP_FW_PATCH };
+            return os_mbuf_append(ctxt->om, st, sizeof(st)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        return BLE_ATT_ERR_READ_NOT_PERMITTED;
+    }
+
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        uint8_t buf[8];
+        uint16_t len = 0;
+        if (OS_MBUF_PKTLEN(ctxt->om) > sizeof(buf)) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &len) != 0) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        if (which == CHR_TIME) {
+            if (len != 4) {
+                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            }
+            uint32_t ts = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) |
+                          ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+            struct timeval tv = { .tv_sec = (time_t)ts, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            time_t t = (time_t)ts;
+            struct tm tm_local;
+            localtime_r(&t, &tm_local);
+            printf("[BLE] 對時完成：Unix %" PRIu32 "（UTC %04d-%02d-%02d %02d:%02d:%02d）\n", ts,
+                   tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday,
+                   tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec);
+            return 0;
+        }
+        if (which == CHR_ACK) {
+            if (len < 1) {
+                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            }
+            s_ack_count++;
+            return 0;
+        }
+        return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+    }
+
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+static const struct ble_gatt_svc_def k_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &k_svc_uuid.u,
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = &k_time_uuid.u,
+                .access_cb = chr_access,
+                .arg = (void *)CHR_TIME,
+                .flags = BLE_GATT_CHR_F_WRITE,
+            },
+            {
+                .uuid = &k_data_uuid.u,
+                .access_cb = chr_access,
+                .arg = (void *)CHR_DATA,
+                .flags = BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &s_data_handle,
+            },
+            {
+                .uuid = &k_ack_uuid.u,
+                .access_cb = chr_access,
+                .arg = (void *)CHR_ACK,
+                .flags = BLE_GATT_CHR_F_WRITE,
+            },
+            {
+                .uuid = &k_status_uuid.u,
+                .access_cb = chr_access,
+                .arg = (void *)CHR_STATUS,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &s_status_handle,
+            },
+            { 0 },
+        },
+    },
+    { 0 },
+};
+
+/* ========================================================================== */
+/*  GAP                                                                         */
+/* ========================================================================== */
+static int gap_event(struct ble_gap_event *event, void *arg)
+{
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0) {
+            s_conn = event->connect.conn_handle;
+            printf("[BLE] App 已連線\n");
+        } else {
+            advertise();
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        printf("[BLE] App 已斷線（原因 0x%x），重新廣播\n", event->disconnect.reason);
+        s_conn = BLE_HS_CONN_HANDLE_NONE;
+        s_data_sub = false;
+        s_status_sub = false;
+        advertise();
+        return 0;
+
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+        advertise();
+        return 0;
+
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.attr_handle == s_data_handle) {
+            s_data_sub = event->subscribe.cur_notify;
+            printf("[BLE] Data Notify %s\n", s_data_sub ? "已訂閱，開始送資料" : "取消訂閱");
+        } else if (event->subscribe.attr_handle == s_status_handle) {
+            s_status_sub = event->subscribe.cur_notify;
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_MTU:
+        printf("[BLE] MTU = %d\n", event->mtu.value);
+        return 0;
+
+    default:
+        return 0;
+    }
+}
+
+static void advertise(void)
+{
+    // 廣播封包：flags(3) + 128-bit Service UUID(18) = 21 bytes；名稱放 scan response
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.uuids128 = &k_svc_uuid;
+    fields.num_uuids128 = 1;
+    fields.uuids128_is_complete = 1;
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        printf("[BLE] 設定廣播資料失敗 rc=%d\n", rc);
+        return;
+    }
+
+    struct ble_hs_adv_fields rsp;
+    memset(&rsp, 0, sizeof(rsp));
+    rsp.name = (uint8_t *)s_name;
+    rsp.name_len = strlen(s_name);
+    rsp.name_is_complete = 1;
+    rc = ble_gap_adv_rsp_set_fields(&rsp);
+    if (rc != 0) {
+        printf("[BLE] 設定 scan response 失敗 rc=%d\n", rc);
+        return;
+    }
+
+    struct ble_gap_adv_params params;
+    memset(&params, 0, sizeof(params));
+    params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &params, gap_event, NULL);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        printf("[BLE] 開始廣播失敗 rc=%d\n", rc);
+    }
+}
+
+static void on_sync(void)
+{
+    if (ble_hs_util_ensure_addr(0) != 0 || ble_hs_id_infer_auto(0, &s_own_addr_type) != 0) {
+        printf("[BLE] 取得 BLE 位址失敗\n");
+        return;
+    }
+    uint8_t addr[6] = { 0 };
+    ble_hs_id_copy_addr(s_own_addr_type, addr, NULL);   // addr[0] 是最低位元組
+    snprintf(s_name, sizeof(s_name), "SmartCup-%02X%02X", addr[1], addr[0]);
+    ble_svc_gap_device_name_set(s_name);
+    s_started = true;
+    printf("[BLE] 開始廣播：%s（位址 %02X:%02X:%02X:%02X:%02X:%02X）\n", s_name,
+           addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+    advertise();
+}
+
+static void on_reset(int reason)
+{
+    printf("[BLE] NimBLE 重置，原因 %d\n", reason);
+}
+
+static void host_task(void *param)
+{
+    nimble_port_run();   // nimble_port_stop() 之前不會返回
+    nimble_port_freertos_deinit();
+}
+
+esp_err_t ble_cup_init(void)
+{
+    // NVS：BLE 控制器要用來存 PHY 校正資料
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nimble_port_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+    // NimBLE 自己的 log 很多，會把序列埠表格打亂，只留警告以上
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
+
+    ble_hs_cfg.sync_cb = on_sync;
+    ble_hs_cfg.reset_cb = on_reset;
+
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    int rc = ble_gatts_count_cfg(k_svcs);
+    if (rc == 0) {
+        rc = ble_gatts_add_svcs(k_svcs);
+    }
+    if (rc != 0) {
+        printf("[BLE] 註冊 GATT 服務失敗 rc=%d\n", rc);
+        return ESP_FAIL;
+    }
+    ble_svc_gap_device_name_set("SmartCup");   // sync 後會換成 SmartCup-XXXX
+
+    nimble_port_freertos_init(host_task);
+    return ESP_OK;
+}
+
+/* ========================================================================== */
+/*  送資料                                                                      */
+/* ========================================================================== */
+static void notify_data(uint8_t type, uint32_t value)
+{
+    uint16_t conn = s_conn;
+    if (conn == BLE_HS_CONN_HANDLE_NONE || !s_data_sub) {
+        return;
+    }
+    uint8_t buf[DATA_LEN];
+    buf[0] = type;
+    put_u32(&buf[1], value);
+    put_u32(&buf[5], (uint32_t)time(NULL));   // 對時前是開機後的秒數
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, sizeof(buf));
+    if (om == NULL) {
+        return;
+    }
+    if (ble_gatts_notify_custom(conn, s_data_handle, om) == 0) {   // om 由 NimBLE 釋放
+        s_notify_count++;
+    }
+}
+
+static int16_t to_deci(float deg, float limit)
+{
+    if (deg > limit) deg = limit;
+    if (deg < -limit) deg = -limit;
+    return (int16_t)lroundf(deg * 10.0f);
+}
+
+void ble_cup_send_water(float pct)
+{
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
+    uint32_t fill25 = (uint32_t)lroundf(pct / 100.0f * (float)FILL25_MAX);
+    if (fill25 > FILL25_MAX) fill25 = FILL25_MAX;
+    uint32_t level = (uint32_t)lroundf(pct / 10.0f);
+    notify_data(MSG_WATER, fill25 | (level << 25));
+}
+
+void ble_cup_send_raw(uint16_t count)
+{
+    notify_data(MSG_RAW, count);
+}
+
+void ble_cup_send_pose(float tilt_deg, uint8_t pose, bool moving)
+{
+    uint32_t tilt = (uint32_t)to_deci(tilt_deg < 0 ? 0 : tilt_deg, 180.0f);
+    notify_data(MSG_POSE, (tilt & 0xFFFF) | ((uint32_t)pose << 16) | ((uint32_t)(moving ? 1 : 0) << 24));
+}
+
+void ble_cup_send_attitude(float pitch_deg, float roll_deg)
+{
+    uint16_t p = (uint16_t)to_deci(pitch_deg, 180.0f);
+    uint16_t r = (uint16_t)to_deci(roll_deg, 180.0f);
+    notify_data(MSG_ATTITUDE, (uint32_t)p | ((uint32_t)r << 16));
+}
+
+void ble_cup_set_battery(uint8_t pct)
+{
+    if (pct == s_battery) {
+        return;
+    }
+    s_battery = pct;
+    uint16_t conn = s_conn;
+    if (conn == BLE_HS_CONN_HANDLE_NONE || !s_status_sub) {
+        return;
+    }
+    uint8_t st[4] = { pct, CUP_FW_MAJOR, CUP_FW_MINOR, CUP_FW_PATCH };
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(st, sizeof(st));
+    if (om != NULL) {
+        ble_gatts_notify_custom(conn, s_status_handle, om);
+    }
+}
+
+ble_cup_state_t ble_cup_state(void)
+{
+    if (!s_started) return BLE_CUP_OFF;
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE) return BLE_CUP_ADVERTISING;
+    return s_data_sub ? BLE_CUP_SUBSCRIBED : BLE_CUP_CONNECTED;
+}
+
+const char *ble_cup_name(void)
+{
+    return s_name;
+}
+
+uint32_t ble_cup_notify_count(void)
+{
+    return s_notify_count;
+}
+
+uint32_t ble_cup_ack_count(void)
+{
+    return s_ack_count;
+}

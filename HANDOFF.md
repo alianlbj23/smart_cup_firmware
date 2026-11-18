@@ -6,7 +6,19 @@
 
 - **已完成**：硬體接線測試程式 `main/main.c`，已燒錄實測。I2C、MPR121、IMU、IMU INT 全部通過；電池項目失敗是因為沒接電池（見第 5 節）
 - **已完成**：銅膠帶電極接上，即時顯示新增「水位%」欄（電極0 兩點直線校正）
-- **還沒開始**：BLE、深度睡眠、正式的水位演算法（濾波、傾斜時不判讀等）
+- **已完成**：BLE（NimBLE，`main/ble_gatt_svr.c`），協定跟 smart_cup_app 的 `cup_protocol.dart` 一致，另外新增 ATTITUDE（0x05）。用 `tools/ble_check.py` 和 App 實測都通過
+- **已完成**：姿態（俯仰／翻滾／傾斜、直立／傾斜／飲用中／倒下、移動判斷）與「水位只在直立靜止時更新」，在 `main/cup_state.c`
+- **還沒開始**：深度睡眠、RL 參考電極的 TI 比例算法、空杯自動重新校正
+
+### BLE 實作備忘
+
+- 協定細節、頻率、姿態門檻都寫在 README 第 5 節。改協定時 App（smart_cup_app）的 `lib/services/cup_protocol.dart` 要同步改
+- 開 BLE 之後要重新產生 sdkconfig（`idf.py set-target esp32c6`），因為舊的 sdkconfig 裡 `CONFIG_BT_ENABLED` 是關的，sdkconfig.defaults 不會覆蓋已存在的設定
+- NimBLE 的 API 照 `examples/bluetooth/nimble/bleprph` 寫；送資料用 `ble_gatts_notify_custom()`，om 由 NimBLE 釋放
+- 128-bit UUID 用 `BLE_UUID128_INIT` 時是 little-endian（倒過來寫），characteristic 編號在第 12 個 byte
+- 廣播封包放不下名稱（flags 3 + UUID128 18 bytes），名稱 `SmartCup-XXXX` 放在 scan response
+- App 寫入用的是 write with response，characteristic 只開 `BLE_GATT_CHR_F_WRITE`
+- 這台開發機有藍牙（hci0），可以用 bleak 直接測；App 連著時電腦連不上
 
 ### 水位量測結果（2026-11-19 實測）
 
@@ -71,7 +83,7 @@
 - **ESP32-C6 的 ADC 校正**支援 curve fitting（`ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED`）。
 - **API 用法以本機原始碼為準**：遇到不確定的 API，直接看 `~/.espressif/v6.1/esp-idf/components/` 底下的標頭檔，以及 `docs/en/migration-guides/release-6.x/`。不要靠記憶。
 
-## 4. 接線測試程式 `main/main.c` 的結構
+## 4. 開機測試（`main/main.c`）的結構
 
 開機等 3 秒，讓 USB 重新連線，接著自動執行：
 
@@ -88,9 +100,9 @@
 5. 電池：取樣 32 次、用 curve fitting 換成 mV 後平均，再 ×2，2.8～4.4 V 算通過
 6. MPR121 IRQ：開機無法自動測，在總結表標「手動」
 
-測完印出總結表，失敗的項目會列出該檢查哪幾條線。接著進入即時顯示：每 0.5 秒一行、每 20 行重印標題，模組沒接好的欄位印「--」。
+測完印出總結表，失敗的項目會列出該檢查哪幾條線。接著記錄姿態零點（`motion_zero`）、啟動 BLE，進入 `live_loop`：每 100 ms 讀 IMU（加速度＋陀螺儀，`imu_read_all`）和 MPR121，每 200 ms 送 ATTITUDE、每 1 秒送 WATER／POSE、每 10 秒量電池；序列埠每 0.5 秒一行、每 20 行重印標題，模組沒接好的欄位印「--」。
 
-**可以直接拿來用的部分**：`reg_read` / `reg_write`、`mpr121_read_filtered` / `mpr121_read_touch`、`imu_read_accel`、`tilt_deg`、`battery_init` / `battery_read`、`display_width` / `print_col`（中文欄位對齊）。
+**可以直接拿來用的部分**：`reg_read` / `reg_write`、`mpr121_read_filtered` / `mpr121_read_touch`、`imu_read_accel`、`imu_read_all`、`tilt_deg`、`battery_init` / `battery_read`、`display_width` / `print_col`（中文欄位對齊）。
 
 ## 5. 已知注意事項
 

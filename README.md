@@ -2,7 +2,7 @@
 
 智慧水杯韌體。用貼在保護套內壁的銅膠帶電極，隔著玻璃杯量測水位。
 
-目前的程式是**硬體接線測試加即時水位顯示**：開機時自動檢查每個模組的接線，接著每 0.5 秒印一行電極讀值、水位 %、加速度和電池電壓。BLE、深度睡眠還沒做。
+開機時自動檢查每個模組的接線，接著每 100 ms 量一次水位和姿態，透過 **BLE** 推送給手機 App [smart_cup_app](https://github.com/alianlbj23/smart_cup_app)，序列埠也會每 0.5 秒印一行數值。深度睡眠還沒做。
 
 | 項目 | 內容 |
 |---|---|
@@ -20,8 +20,8 @@
 
 | 你要做的事 | 怎麼做 | 要改程式嗎 |
 |---|---|---|
-| **平常使用**：看水位 | 燒錄一次，之後開 monitor 看「水位%」欄。見[第 3 節](#3-燒錄) | 不用 |
-| **校正**：第一次組裝、換杯子、重貼電極之後 | 量空杯、滿杯 → 改 `main/main.c` 的兩個數字 → 重新燒錄。見[第 4 節](#4-水位校正) | 改兩個 `#define` |
+| **平常使用**：看水位、姿態 | 燒錄一次，之後用 App 連線（見[第 5 節](#5-ble-與-app)），或開 monitor 看「水位%」欄（見[第 3 節](#3-燒錄)） | 不用 |
+| **校正**：第一次組裝、換杯子、重貼電極之後 | 量空杯、滿杯 → 改 `main/cup_state.c` 的兩個數字 → 重新燒錄。見[第 4 節](#4-水位校正) | 改兩個 `#define` |
 
 ```
                  ┌──────────── 校正（只在需要時做）─────────────┐
@@ -106,19 +106,26 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 1. 等 3 秒，讓 USB 重新連線。
 2. 自動跑 6 項測試，印出總結表：I2C 掃描、MPR121、IMU、IMU INT、電池、MPR121 IRQ。失敗的項目會列出要檢查哪幾條線。
-3. 進入即時顯示，每 0.5 秒一行：
+3. 記錄姿態零點（開機時杯子要**直立放在桌上**），啟動 BLE 並開始廣播 `SmartCup-XXXX`。
+4. 進入即時量測，每 0.5 秒印一行：
 
 ```
- 時間(s) 電極0 電極1  水位%   觸碰 IRQ數 | 加速X(g) 加速Y(g) 加速Z(g) 合計(g) 傾斜(度) | 電池(V)
-     4.7   337   522     63     無     0 |   +0.059   -0.017   +1.005   1.007      3.5 |    0.55
+BLE 名稱：SmartCup-E0CE　｜　水位只在直立靜止時更新，「水位%」後面的 * 代表沿用上一次的值
+ 時間(s) 電極0 電極1  水位%   觸碰 IRQ數 |  俯仰°  翻滾°  傾斜°   姿態 移動 |  電池V    BLE
+     6.5   338   522     62     無     0 |   +0.0   -0.0    0.0   直立   否 |   0.48 傳送中
 ```
 
 | 欄位 | 意思 |
 |---|---|
 | 電極0 | 主條的讀值（0～1023）。**水越多，數字越小** |
 | 電極1 | RL 的讀值。只有水位很低時變化大，目前只顯示、不參與計算 |
-| 水位% | 由電極0 換算，見下一節 |
+| 水位% | 由電極0 換算（見下一節）。傾斜或移動時沿用上一次的值，後面加 `*` |
 | 觸碰 | MPR121 內建的觸碰判斷。**不能拿來判斷水位**：開機時當下的值會被當成基準線 |
+| 俯仰°／翻滾° | 前後／左右傾斜角，已扣掉開機零點 |
+| 傾斜° | 相對直立的總傾斜角 0～180° |
+| 姿態 | 直立／傾斜／飲用中／倒下，判斷方式見[第 5 節](#5-ble-與-app) |
+| 移動 | 最近 0.5 秒內有沒有轉動或晃動 |
+| BLE | 廣播中（等 App 連線）／已連線／傳送中（App 已訂閱資料） |
 
 **只插 USB、沒接電池時**，電池欄會顯示 0.5～0.9 V，總結表裡電池那項判定失敗。這是正常現象：BAT+ 沒接東西，讀到的是殘留電荷慢慢放掉的電壓。
 
@@ -136,26 +143,29 @@ MPR121 讀到的是電極充電後的電壓。水越多，主條的電容越大�
 
 ### 校正程式碼
 
-都在 [main/main.c](main/main.c)：
+水位換算在 [main/cup_state.c](main/cup_state.c)：
 
 ```c
-// MPR121 0x5D：充電時間 1 µs（預設 0.5 µs）。讀值和水位變化量約放大一倍，雜訊不變
-#define MPR121_CONFIG2_RUN      0x44
-
 // 水位校正值：電極0 在空杯、滿杯時的讀值
 #define LEVEL_E0_EMPTY          403
 #define LEVEL_E0_FULL           298
 
-static float water_level_pct(uint16_t e0)
+static float e0_to_pct(float e0)
 {
-    float pct = (float)(LEVEL_E0_EMPTY - (int)e0) * 100.0f / (float)(LEVEL_E0_EMPTY - LEVEL_E0_FULL);
-    if (pct < 0.0f) {
-        pct = 0.0f;
-    } else if (pct > 100.0f) {
-        pct = 100.0f;
-    }
+    float pct = (LEVEL_E0_EMPTY - e0) * 100.0f / (float)(LEVEL_E0_EMPTY - LEVEL_E0_FULL);
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
     return pct;
 }
+```
+
+傳進來的 `e0` 是杯子**直立靜止**時最近 10 筆（約 1 秒）電極0 讀值的平均。杯子傾斜或移動時不更新，沿用上一次的水位。
+
+MPR121 的充電時間設定在 [main/main.c](main/main.c)：
+
+```c
+// MPR121 0x5D：充電時間 1 µs（預設 0.5 µs）。讀值和水位變化量約放大一倍，雜訊不變
+#define MPR121_CONFIG2_RUN      0x44
 ```
 
 ### 什麼時候要重新校正
@@ -205,7 +215,7 @@ python tools/read_levels.py
 
 **步驟 4：把數字寫進程式**
 
-打開 [main/main.c](main/main.c)，搜尋 `LEVEL_E0_EMPTY`，把兩個數字改成步驟 2、3 量到的值，四捨五入成整數：
+打開 [main/cup_state.c](main/cup_state.c)，搜尋 `LEVEL_E0_EMPTY`，把兩個數字改成步驟 2、3 量到的值，四捨五入成整數：
 
 ```c
 #define LEVEL_E0_EMPTY          403     // 空杯時電極0 的讀值   ← 步驟 2
@@ -241,18 +251,93 @@ idf.py -p /dev/ttyACM0 flash monitor
 ### 還沒做
 
 - [docs/wiring.pdf](docs/wiring.pdf) 建議的 TI TIDA-00317 算法：用 RL 當液體參考，算 `水位 = RL 高度 × (主條 − 空杯主條) ÷ (RL − 空杯 RL)`，可以抵銷水質、溫度造成的變化。目前只用主條兩點校正。
-- 只在杯子放下、靜止、直立時量水位，用 IMU 判斷。
 - 空杯值的自動重新校正：杯子移動、環境改變時，空杯讀值會漂移約 10。
 
 ---
 
-## 5. 專案結構
+## 5. BLE 與 App
+
+韌體開機後會一直廣播，App [smart_cup_app](https://github.com/alianlbj23/smart_cup_app) 按「配對水杯」就能找到它。
+
+### 連線
+
+1. 杯子**直立放在桌上**再接上電源（USB 或電池）。開機時的姿態會被當成「直立」的零點。
+2. 等序列埠出現 `[BLE] 開始廣播：SmartCup-XXXX`。XXXX 是 BLE 位址的最後兩個 byte，例如 `SmartCup-E0CE`。
+3. App 按「配對水杯」，從清單選 `SmartCup-XXXX`。連上後 App 會自動對時、訂閱資料，序列埠的 BLE 欄會變成「傳送中」。
+4. 斷線後韌體會自動重新廣播；App 配對過的水杯下次會自動重連。
+
+### 送給 App 的資料
+
+格式跟 App 的 `lib/services/cup_protocol.dart` 一致，程式在 [main/ble_gatt_svr.c](main/ble_gatt_svr.c)。
+
+| UUID（`3c8b00NN-efc1-4061-946c-e5916790df93`） | 方向 | 內容 |
+|---|---|---|
+| `…0001` Service | | |
+| `…0002` Time Sync | App → 杯，Write | Unix 秒數（uint32 LE），連線後 App 會寫一次 |
+| `…0003` Data Notify | 杯 → App，Notify | 9 bytes：type(1) + value(uint32 LE) + 時間戳(uint32 LE) |
+| `…0004` ACK | App → 杯，Write | `0x01` = 收到 |
+| `…0005` Device Status | 杯 → App，Read/Notify | `[電量 %, 韌體 major, minor, patch]`，電量 `0xFF` = 未知（沒接電池） |
+
+| type | 名稱 | 頻率 | value |
+|---|---|---|---|
+| `0x02` | WATER | 1 次/秒 | bits 24..0 = 水量 25-bit 分數（0～2²⁵−1），bits 28..25 = 刻度 0～10 |
+| `0x04` | POSE | 1 次/秒，姿態改變時立刻送 | bits 15..0 = 傾斜角 0.1°，bits 23..16 = 姿態（1 直立、2 傾斜、3 飲用中、4 倒下），bits 31..24 = 移動中 |
+| `0x05` | ATTITUDE | 5 次/秒 | bits 15..0 = pitch（int16，0.1°），bits 31..16 = roll（int16，0.1°）。即時資料，App 不回 ACK |
+| `0x03` | RAW | 目前不送 | 電極0 讀值，除錯用 |
+
+開機後還沒量到有效水位之前（約 1 秒），不會送 WATER。
+
+### 姿態怎麼判斷
+
+都在 [main/cup_state.c](main/cup_state.c) 開頭，可以依實測調整：
+
+| 姿態 | 條件 |
+|---|---|
+| 直立 | 傾斜 < 20°（已經是直立時，超過 25° 才離開） |
+| 倒下 | 傾斜 ≥ 60°，而且連續靜止 2 秒 |
+| 飲用中 | 傾斜 ≥ 35°（不是倒下） |
+| 傾斜 | 其他 |
+| 移動中 | 陀螺儀 > 10 度/秒，或加速度偏離 1 g 超過 0.1 g；之後 0.5 秒內都算移動中 |
+
+- **水位只在直立、而且靜止 1 秒以上時更新**。傾斜、移動、拿在手上時沿用上一次的值，避免水面晃動或手的電容造成誤判。
+- 俯仰角（pitch）正值 = 杯口往前，翻滾角（roll）正值 = 杯口往右。實際裝好後，如果 App 上的方向跟實際相反，把 `cup_state.c` 的 `PITCH_SIGN` 或 `ROLL_SIGN` 改成 `-1.0f`。
+- 開機時如果杯子不是直立靜止（傾斜超過 10° 或在晃動），就不記零點，傾斜角可能會差幾度。
+
+### 用電腦測試 BLE（不用 App）
+
+[tools/ble_check.py](tools/ble_check.py) 會模擬 App 的流程：掃描 `SmartCup-`、對時、讀電量、訂閱資料、回 ACK，最後統計收到的封包。電腦要有藍牙，先裝 [bleak](https://pypi.org/project/bleak/)：
+
+```bash
+python3 -m venv ~/blevenv && ~/blevenv/bin/pip install bleak
+~/blevenv/bin/python tools/ble_check.py 10     # 收 10 秒
+```
+
+正常的輸出（10 秒內 WATER、POSE 各約 10 筆，ATTITUDE 約 50 筆）：
 
 ```
-main/main.c          接線測試 + 即時顯示 + 水位換算
-main/CMakeLists.txt  用到的 ESP-IDF 元件（esp_driver_i2c、esp_driver_gpio、esp_adc、esp_timer）
-sdkconfig.defaults   主控台走 USB Serial/JTAG、4MB Flash
+找到 SmartCup-E0CE 58:E6:C5:12:E0:CE
+Service 存在: True
+Device Status: [255, 0, 2, 0]（電量 未知，韌體 0.2.0）
+10 秒內收到： {'0x02': 10, '0x04': 10, '0x05': 50}
+  最後一筆 WATER 61.14% 刻度 6
+  最後一筆 POSE 直立 傾斜 0.2° 移動 0
+  最後一筆 ATTITUDE pitch -0.1° roll -0.1°
+```
+
+App 連著水杯時，電腦連不上（一次只能連一個）。
+
+---
+
+## 6. 專案結構
+
+```
+main/main.c          接線測試、即時量測迴圈、序列埠顯示、MPR121／IMU／電池讀取
+main/cup_state.c/.h  水位換算與保持、姿態（俯仰／翻滾／傾斜、分類、移動判斷）、電量 %
+main/ble_gatt_svr.c/.h  BLE GATT Server（NimBLE）：廣播、對時、Data Notify、Device Status
+main/CMakeLists.txt  用到的 ESP-IDF 元件（esp_driver_i2c、esp_driver_gpio、esp_adc、esp_timer、bt、nvs_flash）
+sdkconfig.defaults   主控台走 USB Serial/JTAG、4MB Flash、NimBLE
 tools/read_levels.py 校正用：錄一段電極讀值並算平均
+tools/ble_check.py   用電腦模擬 App 測試 BLE
 docs/wiring.pdf      接線圖、電極尺寸、接線順序
 HANDOFF.md           開發交接筆記（ESP-IDF v6 注意事項、已踩過的坑）
 ```
