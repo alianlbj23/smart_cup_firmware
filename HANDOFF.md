@@ -8,10 +8,22 @@
 - **已完成**：銅膠帶電極接上，即時顯示新增「水位%」欄（電極0 兩點直線校正）
 - **已完成**：BLE（NimBLE，`main/ble_gatt_svr.c`），協定跟 smart_cup_app 的 `cup_protocol.dart` 一致，另外新增 ATTITUDE（0x05）。用 `tools/ble_check.py` 和 App 實測都通過
 - **已完成**：姿態（俯仰／翻滾／傾斜、直立／傾斜／飲用中／倒下、移動判斷）與「水位只在直立靜止時更新」，在 `main/cup_state.c`
-- **已完成**：深度睡眠（README 第 6 節）。IMU wake-on-motion 接 D1（ext1 喚醒）＋每 30 分鐘計時器喚醒；接著電腦 USB 時不睡；零點與水位存 RTC 記憶體。App 端加了「找不到水杯時每 20 秒背景重試」
+- **已完成**：休眠（README 第 6 節）。**預設是淺眠、BLE 連線不斷**（使用者不想看到斷線／重新連線）：靜止 30 秒 → IMU wake-on-motion、連線間隔拉長、CPU 自動淺眠（esp_pm），新增 STATE 封包（0x06）讓 App 顯示「水杯休眠中」。深度睡眠保留成選項 `DEEP_SLEEP_ENABLE`（預設 0）。App 端也加了「找不到水杯時每 20 秒背景重試」，深度睡眠模式時用得到
+- **耗電**：C6 沒有 32 kHz 晶振，BLE 淺眠用主晶振，官方數據約 3.3 mA，粗估電池撐 4～5 天（沒實測）。要更省電：開深度睡眠，或硬體加 32 kHz 晶振
 - **還沒開始**：RL 參考電極的 TI 比例算法、空杯自動重新校正
 
 ### 休眠實作備忘（2026-11-19 踩過的坑）
+
+淺眠（預設）：
+
+- sdkconfig 照 `examples/bluetooth/nimble/power_save/sdkconfig.40m.esp32c6`（主晶振當 BLE 睡眠時脈），另外開 `CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION`，接著電腦時不自動淺眠，序列埠才不會斷
+- 休眠迴圈每 250 ms 用 `gpio_get_level` 看 D1（IMU INT 是閂鎖的，不會漏），不需要設定 GPIO 喚醒源；`vTaskDelay` 期間 tickless idle 會自動淺眠
+- **App 訂閱的當下立刻送資料，App 會漏掉**（實測：剛連上時水位、姿態顯示「--」）。改成訂閱後 1.5 秒補送（`SUBSCRIBE_RESEND_MS`）
+- 喚醒時用 `test_imu_id()` 把 IMU 重置回一般模式（同時清掉 WOM 閂鎖），並呼叫 `cup_motion_mark_moving()`，不然醒來後「已靜止很久」會馬上又睡
+- **同一時間只能有一個 App 連著**：測試時發現使用者開著舊版 Linux App 自動連上，其他程式都掃不到水杯；而且 Linux App 關掉後 BlueZ 會留著連線（`bluetoothctl info` 顯示 Connected: yes），要 `bluetoothctl disconnect`。App 已改成關閉視窗前先斷線
+- bleak 和 App 同時連著時，bleak 每筆通知會收到兩次（BlueZ 的行為，不是韌體送兩次；App 的接收紀錄沒有重複）
+
+深度睡眠（`DEEP_SLEEP_ENABLE=1` 時）：
 
 - v6 起喚醒原因用 `esp_sleep_get_wakeup_causes()`（bitmap），舊的 `esp_sleep_get_wakeup_cause()` 已 deprecated；ext1 用 `esp_sleep_enable_ext1_wakeup_io()`，C6 的 GPIO 0～7 可用，每支腳可各自設定電位
 - **IMU 剛切到 wake-on-motion 時，頭幾筆低功耗取樣會觸發中斷**：沒處理的話一睡下去 0.4 秒就被叫醒。現在切換後等 300 ms，再清 INT_STATUS、等超過一個取樣週期（150 ms）確認 D1 是低電位才睡

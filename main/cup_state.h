@@ -42,6 +42,9 @@ bool cup_motion_has_zero(void);
 void cup_motion_update(float ax, float ay, float az, float gx, float gy, float gz,
                        uint32_t now_ms, cup_motion_t *out);
 
+// 從休眠醒來時呼叫：把「最後一次移動」設成現在，避免醒來後馬上又因為「已靜止很久」睡回去
+void cup_motion_mark_moving(uint32_t now_ms);
+
 const char *cup_pose_label(cup_pose_t pose);
 
 // 水位：每次讀到電極0 就呼叫；valid = 這一刻量到的值可信（cup_motion_t.water_ok）

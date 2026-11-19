@@ -36,6 +36,7 @@ static const ble_uuid128_t k_status_uuid = CUP_UUID(0x05);
 #define MSG_RAW       0x03
 #define MSG_POSE      0x04
 #define MSG_ATTITUDE  0x05
+#define MSG_STATE     0x06
 #define DATA_LEN      9
 #define FILL25_MAX    ((1u << 25) - 1)
 
@@ -53,6 +54,28 @@ static uint8_t s_own_addr_type;
 static char s_name[20];
 static volatile uint8_t s_battery = 0xFF;
 static volatile uint32_t s_notify_count, s_ack_count;
+static volatile uint32_t s_subscribe_count;
+static volatile bool s_low_power;
+
+// 連線參數（間隔單位 1.25 ms、逾時單位 10 ms）
+static const struct ble_gap_upd_params k_conn_fast = {
+    .itvl_min = 24, .itvl_max = 40,          // 30～50 ms：ATTITUDE 每秒 5 次夠用
+    .latency = 0, .supervision_timeout = 400, // 4 秒
+    .min_ce_len = 0, .max_ce_len = 0,
+};
+static const struct ble_gap_upd_params k_conn_doze = {
+    .itvl_min = 400, .itvl_max = 800,        // 0.5～1 秒：休眠時大部分時間都在睡
+    .latency = 0, .supervision_timeout = 600, // 6 秒
+    .min_ce_len = 0, .max_ce_len = 0,
+};
+
+static void request_conn_params(uint16_t conn)
+{
+    int rc = ble_gap_update_params(conn, s_low_power ? &k_conn_doze : &k_conn_fast);
+    if (rc != 0) {
+        printf("[BLE] 要求更新連線參數失敗 rc=%d\n", rc);
+    }
+}
 
 static void advertise(void);
 
@@ -165,6 +188,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_conn = event->connect.conn_handle;
             printf("[BLE] App 已連線\n");
+            if (s_low_power) {
+                request_conn_params(event->connect.conn_handle);   // 休眠中連上：直接用省電參數
+            }
         } else {
             advertise();
         }
@@ -189,9 +215,21 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_SUBSCRIBE:
         if (event->subscribe.attr_handle == s_data_handle) {
             s_data_sub = event->subscribe.cur_notify;
+            if (s_data_sub) {
+                s_subscribe_count++;
+            }
             printf("[BLE] Data Notify %s\n", s_data_sub ? "已訂閱，開始送資料" : "取消訂閱");
         } else if (event->subscribe.attr_handle == s_status_handle) {
             s_status_sub = event->subscribe.cur_notify;
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        if (event->conn_update.status == 0) {
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
+                printf("[BLE] 連線間隔 %.1f ms\n", desc.conn_itvl * 1.25);
+            }
         }
         return 0;
 
@@ -234,6 +272,10 @@ static void advertise(void)
     memset(&params, 0, sizeof(params));
     params.conn_mode = BLE_GAP_CONN_MODE_UND;
     params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    if (s_low_power) {
+        params.itvl_min = 1600;   // 1 秒（單位 0.625 ms）：休眠時放慢廣播省電
+        params.itvl_max = 1600;
+    }                             // 0 = NimBLE 預設的快速廣播
     rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &params, gap_event, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         printf("[BLE] 開始廣播失敗 rc=%d\n", rc);
@@ -377,6 +419,38 @@ void ble_cup_set_battery(uint8_t pct)
     if (om != NULL) {
         ble_gatts_notify_custom(conn, s_status_handle, om);
     }
+}
+
+void ble_cup_send_state(uint8_t state, uint32_t seconds_in_state)
+{
+    if (seconds_in_state > 0xFFFFFF) {
+        seconds_in_state = 0xFFFFFF;
+    }
+    notify_data(MSG_STATE, (uint32_t)state | (seconds_in_state << 8));
+}
+
+void ble_cup_set_low_power(bool on)
+{
+    if (s_low_power == on) {
+        return;
+    }
+    s_low_power = on;
+    if (!s_started) {
+        return;
+    }
+    uint16_t conn = s_conn;
+    if (conn != BLE_HS_CONN_HANDLE_NONE) {
+        request_conn_params(conn);
+    } else {
+        // 廣播中：用新的間隔重新開始廣播
+        ble_gap_adv_stop();
+        advertise();
+    }
+}
+
+uint32_t ble_cup_subscribe_count(void)
+{
+    return s_subscribe_count;
 }
 
 void ble_cup_shutdown(void)

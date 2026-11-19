@@ -35,6 +35,7 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_sleep.h"
+#include "esp_pm.h"
 #include "driver/usb_serial_jtag.h"
 
 #include "cup_state.h"
@@ -79,18 +80,30 @@
 #define BATTERY_EVERY           100     // 每 10 秒量一次電池
 #define LIVE_HEADER_EVERY       20      // 每 20 行重印一次欄位標題
 
-// 休眠（深度睡眠）：杯子靜止一段時間就睡，拿起杯子（IMU wake-on-motion → D1）或計時器到了就醒
-#ifndef SLEEP_IDLE_MS
-#define SLEEP_IDLE_MS           30000   // 沒有 App 連線時，靜止 30 秒就睡（App 每 20 秒重試，醒著 30 秒一定接得到）
+// 休眠（淺眠）：杯子靜止一段時間就進入「休眠」，BLE 連線保持不斷，拿起杯子（IMU wake-on-motion → D1）馬上恢復。
+// 休眠中 CPU 大部分時間在自動淺眠（esp_pm），連線間隔拉長到 0.5～1 秒；水位照樣定期量（加水時杯子不一定會動）
+#ifndef DOZE_IDLE_MS
+#define DOZE_IDLE_MS            30000   // 靜止 30 秒就休眠（從最後一次移動或 App 連上算起，取較晚的）
 #endif
-#ifndef SLEEP_IDLE_CONNECTED_MS
-#define SLEEP_IDLE_CONNECTED_MS 120000  // App 連著時，靜止 2 分鐘才睡
+#define DOZE_POLL_MS            250     // 休眠中每 250 ms 看一次 D1（IMU 的 INT 是閂鎖的，不會漏掉）
+#define SUBSCRIBE_RESEND_MS     1500    // App 訂閱後等 1.5 秒再補送目前狀態（太早送，App 可能還沒準備好接收而漏掉）
+#define DOZE_KEEPALIVE_MS       10000   // 休眠中每 10 秒送一次 STATE，讓 App 知道還在休眠
+#define DOZE_WATER_CHECK_MS     5000    // 休眠中每 5 秒量一次水位
+#define DOZE_WATER_FORCE_MS     30000   // 水位沒變也每 30 秒送一次
+#define DOZE_WATER_DELTA_PCT    1.0f    // 水位變化 ≥ 1% 就立刻送
+#define DOZE_BATTERY_MS         60000   // 休眠中每 60 秒量一次電池
+
+// 深度睡眠（預設關閉）：打開後，休眠中「沒有 App 連線」超過 DEEP_SLEEP_AFTER_MS 就進深度睡眠，
+// 比淺眠省很多電，但 BLE 會關掉（App 要等水杯醒來再自動連回）
+#ifndef DEEP_SLEEP_ENABLE
+#define DEEP_SLEEP_ENABLE       0
 #endif
+#define DEEP_SLEEP_AFTER_MS     (30 * 60 * 1000)
 #ifndef SLEEP_TIMER_WAKE_S
-#define SLEEP_TIMER_WAKE_S      1800    // 睡著後每 30 分鐘自己醒來量一次水位、廣播一下
+#define SLEEP_TIMER_WAKE_S      1800    // 深度睡眠後每 30 分鐘自己醒來量一次水位、廣播一下
 #endif
 #ifndef SLEEP_ON_USB
-#define SLEEP_ON_USB            0       // 1 = 接著電腦 USB 也會睡（只在測試休眠時用）
+#define SLEEP_ON_USB            0       // 1 = 接著電腦 USB 也會進深度睡眠（只在測試時用）
 #endif
 #define WOM_THRESHOLD           12      // wake-on-motion 門檻，單位 4 mg → 48 mg
 #define WOM_LP_ODR              5       // 低功耗加速度取樣率代碼：5 = 7.81 Hz
@@ -1109,17 +1122,6 @@ static void motion_zero(void)
 /* -------------------------------------------------------------------------- */
 /*  休眠                                                                        */
 /* -------------------------------------------------------------------------- */
-// 電腦的 USB 連著（收得到 SOF 封包）時不休眠：開發、校正時序列埠才不會斷。
-// 接行動電源或充電器不算連著，照樣會睡。
-static bool usb_host_connected(void)
-{
-#if SLEEP_ON_USB
-    return false;
-#else
-    return usb_serial_jtag_is_connected();
-#endif
-}
-
 // IMU 切到低功耗 wake-on-motion：只開加速度、低取樣率，晃動超過門檻就把 INT 拉高並閂鎖
 // （依 MPU-6500 / MPU-9250 datasheet 的 Wake-on-Motion 設定步驟）
 static esp_err_t imu_enter_wom(void)
@@ -1144,50 +1146,160 @@ static esp_err_t imu_enter_wom(void)
     return ESP_OK;
 }
 
-// 進入深度睡眠。醒來後會從 app_main 重新開始（RTC_DATA_ATTR 的變數會保留）
-static void enter_deep_sleep(uint32_t idle_ms)
+// 啟用 wake-on-motion 並等它穩定。剛切換時，頭幾筆低功耗取樣會和初始參考值比較而觸發中斷
+// （實測：沒處理的話一睡下去 0.4 秒就被叫醒），所以：
+//   1. 先等 300 ms，讓 IMU 取完至少兩筆樣本（7.81 Hz → 每筆約 128 ms）
+//   2. 讀 INT_STATUS 清掉閂鎖，再等超過一個取樣週期，確認 D1 維持低電位；
+//      又被拉高就再清一次，最多 10 次
+// 回傳 false = IMU 設定失敗（不能靠晃動喚醒）
+static bool imu_wom_arm(void)
 {
-    printf("\n[休眠] 已靜止 %" PRIu32 " 秒，進入深度睡眠（拿起杯子或 %d 分鐘後喚醒）\n",
-           idle_ms / 1000, SLEEP_TIMER_WAKE_S / 60);
-
-    ble_cup_shutdown();
-
-    // MPR121 進入停止模式（約 3 µA）；醒來後開機流程會重新設定
-    if (s_mpr_ready) {
-        (void)reg_write(s_mpr_dev, MPR121_REG_ECR, MPR121_ECR_STOP);
+    if (imu_enter_wom() != ESP_OK) {
+        return false;
     }
-
-    // IMU 改成 wake-on-motion。剛切換時，頭幾筆低功耗取樣會和初始參考值比較而觸發中斷
-    // （實測：沒處理的話一睡下去 0.4 秒就被叫醒），所以：
-    //   1. 先等 300 ms，讓 IMU 取完至少兩筆樣本（7.81 Hz → 每筆約 128 ms）
-    //   2. 讀 INT_STATUS 清掉閂鎖，再等超過一個取樣週期，確認 D1 維持低電位才睡；
-    //      又被拉高就再清一次，最多 10 次
-    bool wom_ok = imu_enter_wom() == ESP_OK;
     vTaskDelay(pdMS_TO_TICKS(300));
-    bool int_low = false;
-    for (int i = 0; i < 10 && wom_ok; i++) {
+    for (int i = 0; i < 10; i++) {
         uint8_t int_status = 0;
         (void)reg_read(s_imu_dev, MPU_REG_INT_STATUS, &int_status, 1);
         vTaskDelay(pdMS_TO_TICKS(150));
         if (gpio_get_level(PIN_IMU_INT) == 0) {
-            int_low = true;
-            break;
+            return true;
         }
     }
-    if (wom_ok && !int_low) {
-        printf("[休眠] D1 一直是高電位（杯子還在晃？），醒來後會再試\n");
-    }
-    if (wom_ok) {
-        esp_sleep_enable_ext1_wakeup_io(1ULL << PIN_IMU_INT, ESP_EXT1_WAKEUP_ANY_HIGH);
-    } else {
-        printf("[休眠] IMU wake-on-motion 設定失敗，只靠計時器喚醒\n");
-    }
-    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_TIMER_WAKE_S * 1000000ULL);
+    printf("[休眠] D1 一直是高電位（杯子還在晃？）\n");
+    return true;
+}
 
+#if DEEP_SLEEP_ENABLE
+// 電腦的 USB 連著（收得到 SOF 封包）時不進深度睡眠：開發、校正時序列埠才不會斷。
+// 接行動電源或充電器不算連著，照樣會睡。
+static bool usb_host_connected(void)
+{
+#if SLEEP_ON_USB
+    return false;
+#else
+    return usb_serial_jtag_is_connected();
+#endif
+}
+
+// 進入深度睡眠（IMU 已在 wake-on-motion）。醒來後會從 app_main 重新開始（RTC_DATA_ATTR 的變數會保留）
+static void enter_deep_sleep(void)
+{
+    printf("\n[休眠] 休眠中沒有 App 連線超過 %d 分鐘，進入深度睡眠（拿起杯子或 %d 分鐘後喚醒）\n",
+           DEEP_SLEEP_AFTER_MS / 60000, SLEEP_TIMER_WAKE_S / 60);
+    ble_cup_shutdown();
+    // MPR121 進入停止模式（約 3 µA）；醒來後開機流程會重新設定
+    if (s_mpr_ready) {
+        (void)reg_write(s_mpr_dev, MPR121_REG_ECR, MPR121_ECR_STOP);
+    }
+    esp_sleep_enable_ext1_wakeup_io(1ULL << PIN_IMU_INT, ESP_EXT1_WAKEUP_ANY_HIGH);
+    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_TIMER_WAKE_S * 1000000ULL);
     s_sleep_count++;
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(20));
     esp_deep_sleep_start();
+}
+#endif
+
+static uint32_t uptime_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+// 休眠中量水位：連讀 10 筆（每筆隔 20 ms）餵給 cup_state 平均。杯子不是直立時不更新水位
+static void doze_measure_water(bool upright)
+{
+    if (!s_mpr_ready) {
+        return;
+    }
+    for (int i = 0; i < 10; i++) {
+        uint16_t e0, e1;
+        if (mpr121_read_filtered(&e0, &e1)) {
+            cup_water_add_sample(e0, upright);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// 休眠：IMU 改成 wake-on-motion，BLE 改用省電參數但不斷線，CPU 大部分時間自動淺眠。
+// 每 250 ms 看一次 D1，杯子被拿起或晃動就返回（回到一般的即時量測）
+static void doze_loop(uint32_t idle_ms, const cup_motion_t *last)
+{
+    uint32_t start = uptime_ms();
+    bool upright = (last->pose == CUP_POSE_UPRIGHT);
+    printf("\n[休眠] 已靜止 %" PRIu32 " 秒，進入休眠（藍牙保持連線，拿起杯子就會喚醒）\n", idle_ms / 1000);
+
+    if (!imu_wom_arm()) {
+        printf("[休眠] IMU wake-on-motion 設定失敗，不休眠\n");
+        return;
+    }
+    ble_cup_set_low_power(true);
+    ble_cup_send_state(CUP_STATE_DOZING, 0);
+
+    uint32_t sub_count = ble_cup_subscribe_count();
+    uint32_t resend_at = 0;   // 0 = 沒有待補送
+    uint32_t last_keepalive = start, last_water_check = start, last_water_sent = start, last_battery = start;
+    float sent_pct = -100.0f;
+    (void)cup_water_get(&sent_pct);
+
+    while (gpio_get_level(PIN_IMU_INT) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(DOZE_POLL_MS));
+        uint32_t now = uptime_ms();
+        uint32_t secs = (now - start) / 1000;
+
+        // App 剛連上／訂閱：1.5 秒後補送「休眠中」、最新水位和休眠前最後的姿態，
+        // App 一連上就有完整畫面（休眠中平常不送姿態）
+        if (ble_cup_subscribe_count() != sub_count) {
+            sub_count = ble_cup_subscribe_count();
+            resend_at = now + SUBSCRIBE_RESEND_MS;
+        }
+        if (resend_at != 0 && (int32_t)(now - resend_at) >= 0) {
+            resend_at = 0;
+            ble_cup_send_state(CUP_STATE_DOZING, secs);
+            float pct;
+            if (cup_water_get(&pct)) {
+                ble_cup_send_water(pct);
+            }
+            ble_cup_send_pose(last->tilt_deg, (uint8_t)last->pose, false);
+            ble_cup_send_attitude(last->pitch_deg, last->roll_deg);
+            last_keepalive = now;
+        }
+        if (now - last_keepalive >= DOZE_KEEPALIVE_MS) {
+            ble_cup_send_state(CUP_STATE_DOZING, secs);
+            last_keepalive = now;
+        }
+        if (now - last_water_check >= DOZE_WATER_CHECK_MS) {
+            last_water_check = now;
+            doze_measure_water(upright);
+            float pct;
+            if (cup_water_get(&pct) &&
+                (fabsf(pct - sent_pct) >= DOZE_WATER_DELTA_PCT || now - last_water_sent >= DOZE_WATER_FORCE_MS)) {
+                ble_cup_send_water(pct);
+                sent_pct = pct;
+                last_water_sent = now;
+                printf("[休眠] 已休眠 %" PRIu32 " 秒 · 水位 %.0f%% · BLE %s\n", secs, pct,
+                       ble_cup_state() == BLE_CUP_SUBSCRIBED ? "連線中" : "廣播中");
+            }
+        }
+        if (now - last_battery >= DOZE_BATTERY_MS) {
+            last_battery = now;
+            int pin_mv, bat_mv;
+            ble_cup_set_battery(battery_read(&pin_mv, &bat_mv) ? cup_battery_percent(bat_mv) : 0xFF);
+        }
+#if DEEP_SLEEP_ENABLE
+        if (ble_cup_state() == BLE_CUP_ADVERTISING && !usb_host_connected() && now - start >= DEEP_SLEEP_AFTER_MS) {
+            enter_deep_sleep();   // 不會返回
+        }
+#endif
+    }
+
+    // 喚醒：IMU 重置回一般模式（同時清掉 WOM 的閂鎖），BLE 恢復快速參數
+    uint32_t dozed_s = (uptime_ms() - start) / 1000;
+    test_imu_id();
+    cup_motion_mark_moving(uptime_ms());
+    ble_cup_set_low_power(false);
+    ble_cup_send_state(CUP_STATE_ACTIVE, 0);
+    printf("[休眠] 偵測到移動，喚醒（休眠了 %" PRIu32 " 秒）\n", dozed_s);
 }
 
 // 欄寬（以終端機顯示寬度計算，中文字算 2 格）
@@ -1258,6 +1370,9 @@ static void live_loop(void)
     cup_pose_t last_sent_pose = CUP_POSE_UNKNOWN;
     bool was_connected = false;
     uint32_t connected_at_ms = 0;
+    uint32_t active_since_ms = uptime_ms();               // 這次「活動中」從什麼時候開始（STATE 的秒數）
+    uint32_t sub_count = ble_cup_subscribe_count();
+    uint32_t state_resend_at = 0;                         // 0 = 沒有待補送
     bool have_e = false;
     uint16_t e0 = 0, e1 = 0;
     int bat_mv = -1;
@@ -1302,28 +1417,43 @@ static void live_loop(void)
             }
         }
 
+        // App 剛連上／訂閱：1.5 秒後告訴它「活動中」
+        if (ble_cup_subscribe_count() != sub_count) {
+            sub_count = ble_cup_subscribe_count();
+            state_resend_at = now_ms + SUBSCRIBE_RESEND_MS;
+        }
+        if (state_resend_at != 0 && (int32_t)(now_ms - state_resend_at) >= 0) {
+            state_resend_at = 0;
+            ble_cup_send_state(CUP_STATE_ACTIVE, (now_ms - active_since_ms) / 1000);
+        }
+
         // ---- 休眠判斷 ----
-        // 接著電腦 USB、或沒有 IMU（睡了就叫不醒）時不睡
-        bool usb = usb_host_connected();
         ble_cup_state_t bst = ble_cup_state();
         bool connected = (bst == BLE_CUP_CONNECTED || bst == BLE_CUP_SUBSCRIBED);
         if (connected && !was_connected) {
-            connected_at_ms = now_ms;   // App 剛連上：從現在重新算閒置時間
+            connected_at_ms = now_ms;   // App 剛連上：從現在重新算閒置時間，讓 App 先看到 30 秒即時資料
         }
         was_connected = connected;
-        // 閒置時間 = 從「最後一次移動」或「App 連上」（取較晚的）到現在。
-        // 只看移動的話，水杯醒著靜止一陣子後 App 才連上，等待上限一換成「連線中」就會立刻睡
+        // 閒置時間 = 從「最後一次移動」或「App 連上」（取較晚的）到現在
         uint32_t idle_ms = motion.still_ms;
         if (connected && now_ms - connected_at_ms < idle_ms) {
             idle_ms = now_ms - connected_at_ms;
         }
         int32_t sleep_left_ms = -1;
-        if (have_motion && !usb) {
-            uint32_t limit = connected ? SLEEP_IDLE_CONNECTED_MS : SLEEP_IDLE_MS;
-            if (idle_ms >= limit) {
-                enter_deep_sleep(idle_ms);   // 不會返回
+        if (have_motion) {   // 沒有 IMU（休眠後叫不醒）時不休眠
+            if (idle_ms >= DOZE_IDLE_MS) {
+                doze_loop(idle_ms, &motion);   // 杯子被拿起才返回
+                // 回到即時量測：重新開始計時，馬上補送一次姿態與水位
+                tick = 0;
+                last_sent_pose = CUP_POSE_UNKNOWN;
+                active_since_ms = uptime_ms();
+                connected_at_ms = active_since_ms;
+                sub_count = ble_cup_subscribe_count();
+                state_resend_at = 0;
+                last_wake = xTaskGetTickCount();
+                continue;
             }
-            sleep_left_ms = (int32_t)(limit - idle_ms);
+            sleep_left_ms = (int32_t)(DOZE_IDLE_MS - idle_ms);
         }
 
         // ---- 序列埠顯示 ----
@@ -1334,9 +1464,7 @@ static void live_loop(void)
             char f_time[16], f_e0[8] = "--", f_e1[8] = "--", f_level[12] = "--", f_touch[16] = "--", f_irq[12] = "--";
             char f_p[12] = "--", f_r[12] = "--", f_t[12] = "--", f_pose[16] = "--", f_move[12] = "--";
             char f_bat[12] = "--", f_sleep[12] = "--";
-            if (usb) {
-                snprintf(f_sleep, sizeof(f_sleep), "USB");
-            } else if (sleep_left_ms >= 0) {
+            if (sleep_left_ms >= 0) {
                 snprintf(f_sleep, sizeof(f_sleep), "%" PRId32 "s", (sleep_left_ms + 999) / 1000);
             }
 
@@ -1475,6 +1603,20 @@ void app_main(void)
     if (!s_woke_from_sleep || !cup_motion_has_zero()) {
         motion_zero();
     }
+
+#if CONFIG_PM_ENABLE
+    // 電源管理：沒事做時 CPU 降到 40 MHz、自動淺眠（BLE 控制器會在連線事件之間一起睡）。
+    // 接著電腦 USB 時不會淺眠（CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION），序列埠才不會斷
+    esp_pm_config_t pm = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = CONFIG_XTAL_FREQ,
+        .light_sleep_enable = true,
+    };
+    err = esp_pm_configure(&pm);
+    if (err != ESP_OK) {
+        printf("  電源管理設定失敗（%s），不會自動淺眠\n", esp_err_to_name(err));
+    }
+#endif
 
     // BLE：廣播 SmartCup-XXXX，App 連上並訂閱後開始推送水位、姿態
     err = ble_cup_init();

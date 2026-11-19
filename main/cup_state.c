@@ -130,6 +130,12 @@ void cup_motion_update(float ax, float ay, float az, float gx, float gy, float g
     out->water_ok = (pose == CUP_POSE_UPRIGHT) && still_ms >= WATER_SETTLE_MS;
 }
 
+void cup_motion_mark_moving(uint32_t now_ms)
+{
+    s_last_move_ms = now_ms;
+    s_have_sample = true;
+}
+
 const char *cup_pose_label(cup_pose_t pose)
 {
     switch (pose) {

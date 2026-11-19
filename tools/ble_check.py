@@ -24,6 +24,9 @@ def decode(b: bytes):
     if t == 5:
         p, r = struct.unpack("<hh", struct.pack("<I", v))
         return t, f"ATTITUDE pitch {p / 10:+.1f}° roll {r / 10:+.1f}°", ts
+    if t == 6:
+        state = {0: "活動中", 1: "休眠中"}.get(v & 0xFF, f"未知({v & 0xFF})")
+        return t, f"STATE {state}（已 {v >> 8} 秒）", ts
     return t, f"type 0x{t:02x} value {v}", ts
 
 
@@ -46,8 +49,12 @@ async def main():
         last = {}
         first_ts = []
 
+        t_start = time.time()
+
         async def on_data(_, data: bytearray):
             t, text, ts = decode(bytes(data))
+            if t == 6:   # 狀態改變很重要，每一筆都印出來
+                print(f"  {time.time() - t_start:5.1f}s  {text}", flush=True)
             counts[t] += 1
             last[t] = text
             if not first_ts:

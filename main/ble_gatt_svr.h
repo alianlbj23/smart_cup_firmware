@@ -13,6 +13,8 @@
  *   0x03 RAW      電極0 濾波後讀值（除錯用）
  *   0x04 POSE     bits 15..0 = 傾斜角 0.1°（0～1800），bits 23..16 = 姿態代碼，bits 31..24 = 移動中
  *   0x05 ATTITUDE bits 15..0 = pitch int16 0.1°，bits 31..16 = roll int16 0.1°（App 不回 ACK）
+ *   0x06 STATE    bits 7..0 = 狀態（0 活動中、1 休眠中），bits 31..8 = 進入目前狀態幾秒
+ *                 狀態改變時、App 訂閱後立刻送；休眠中每 10 秒送一次
  *
  * 廣播名稱「SmartCup-XXXX」，XXXX = BLE 位址最後兩個 byte。
  */
@@ -44,6 +46,17 @@ void ble_cup_send_water(float pct);
 void ble_cup_send_raw(uint16_t count);
 void ble_cup_send_pose(float tilt_deg, uint8_t pose, bool moving);
 void ble_cup_send_attitude(float pitch_deg, float roll_deg);
+
+#define CUP_STATE_ACTIVE 0
+#define CUP_STATE_DOZING 1
+void ble_cup_send_state(uint8_t state, uint32_t seconds_in_state);
+
+// 休眠（淺眠）時呼叫 true：連線中改用長連線間隔（約 0.5～1 秒）、沒連線時放慢廣播（1 秒），省電但連線不斷；
+// 醒來呼叫 false 恢復
+void ble_cup_set_low_power(bool on);
+
+// App 每訂閱一次 Data Notify 就加 1（主程式用來判斷「剛訂閱」，馬上補送目前狀態）
+uint32_t ble_cup_subscribe_count(void);
 
 // 更新電量（0～100，0xFF = 未知）；數值有變而且 App 有訂閱時會 Notify
 void ble_cup_set_battery(uint8_t pct);
