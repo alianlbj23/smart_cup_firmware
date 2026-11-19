@@ -4,6 +4,7 @@
  *   姿態：由加速度算俯仰角、翻滾角、總傾斜角，由陀螺儀判斷是否移動，再分類成
  *         直立／傾斜／飲用中／倒下（代碼與 App 的 CupPose 一致）
  *   水位：只在「直立且靜止」時更新；傾斜或移動時保持最後一次有效的水位
+ *   零點與最後的水位存在 RTC 記憶體，深度睡眠喚醒後沿用
  *   電量：電池電壓 → 百分比
  */
 #pragma once
@@ -33,6 +34,9 @@ typedef struct {
 // 開機時把「直立靜止」的重力方向與陀螺儀偏移記成零點。
 // 傳入多次取樣的平均值；傾斜超過 10° 或不是靜止時不採用（回傳 false，零點維持 0）。
 bool cup_motion_set_zero(float ax, float ay, float az, float gx, float gy, float gz);
+
+// 是否已經有零點（冷開機後設定過；深度睡眠喚醒後仍保留）
+bool cup_motion_has_zero(void);
 
 // 每次讀到 IMU 就呼叫一次（加速度單位 g、角速度單位 度/秒）
 void cup_motion_update(float ax, float ay, float az, float gx, float gy, float gz,

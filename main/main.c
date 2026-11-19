@@ -34,6 +34,8 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "esp_sleep.h"
+#include "driver/usb_serial_jtag.h"
 
 #include "cup_state.h"
 #include "ble_gatt_svr.h"
@@ -76,6 +78,22 @@
 #define WATER_EVERY             10      // 每 1 秒送一次 WATER、POSE（姿態改變時會立刻送 POSE）
 #define BATTERY_EVERY           100     // 每 10 秒量一次電池
 #define LIVE_HEADER_EVERY       20      // 每 20 行重印一次欄位標題
+
+// 休眠（深度睡眠）：杯子靜止一段時間就睡，拿起杯子（IMU wake-on-motion → D1）或計時器到了就醒
+#ifndef SLEEP_IDLE_MS
+#define SLEEP_IDLE_MS           30000   // 沒有 App 連線時，靜止 30 秒就睡（App 每 20 秒重試，醒著 30 秒一定接得到）
+#endif
+#ifndef SLEEP_IDLE_CONNECTED_MS
+#define SLEEP_IDLE_CONNECTED_MS 120000  // App 連著時，靜止 2 分鐘才睡
+#endif
+#ifndef SLEEP_TIMER_WAKE_S
+#define SLEEP_TIMER_WAKE_S      1800    // 睡著後每 30 分鐘自己醒來量一次水位、廣播一下
+#endif
+#ifndef SLEEP_ON_USB
+#define SLEEP_ON_USB            0       // 1 = 接著電腦 USB 也會睡（只在測試休眠時用）
+#endif
+#define WOM_THRESHOLD           12      // wake-on-motion 門檻，單位 4 mg → 48 mg
+#define WOM_LP_ODR              5       // 低功耗加速度取樣率代碼：5 = 7.81 Hz
 
 #define RAD_TO_DEG              57.2957795f
 
@@ -129,6 +147,10 @@
 #define MPU_REG_ACCEL_CONFIG2   0x1D    // bit3 ACCEL_FCHOICE_B、bit2:0 A_DLPF_CFG：加速度低通濾波
 #define MPU_REG_INT_PIN_CFG     0x37    // INT 腳設定：bit7 ACTL（0=高電位有效）、bit6 OPEN（0=推挽）
                                         //   bit5 LATCH_INT_EN（0=每次發 50 µs 脈衝）
+#define MPU_REG_LP_ACCEL_ODR    0x1E    // 低功耗加速度取樣率（wake-on-motion 用）
+#define MPU_REG_WOM_THR         0x1F    // wake-on-motion 門檻，單位 4 mg
+#define MPU_REG_INT_STATUS      0x3A    // 中斷狀態，讀取會清除（閂鎖模式下 INT 腳回到低電位）
+#define MPU_REG_MOT_DETECT_CTRL 0x69    // bit7 ACCEL_INTEL_EN、bit6 ACCEL_INTEL_MODE（1 = 和前一筆比較）
 #define MPU_REG_INT_ENABLE      0x38    // 中斷致能：bit0 RAW_RDY_EN = 資料就緒中斷
 #define MPU_REG_ACCEL_XOUT_H    0x3B    // 0x3B～0x40：加速度 X/Y/Z，各 16 位元有號數，高位元組在前
 #define MPU_REG_PWR_MGMT_1      0x6B    // 電源管理 1：bit7 H_RESET（重置）、bit6 SLEEP、bit2:0 CLKSEL
@@ -194,6 +216,10 @@ static const char *s_adc_cali_name = "未校正";
 
 static volatile uint32_t s_imu_int_count;   // D1 上升緣計數（IMU 資料就緒）
 static volatile uint32_t s_mpr_irq_count;   // D2 下降緣計數（MPR121 IRQ）
+
+// 休眠相關（RTC 記憶體，深度睡眠時保留；冷開機清成 0）
+static RTC_DATA_ATTR uint32_t s_sleep_count;   // 進入深度睡眠的次數
+static bool s_woke_from_sleep;                 // 這次開機是不是從深度睡眠醒來
 
 /* ========================================================================== */
 /*  小工具：結果字串、中文對齊                                                  */
@@ -1080,6 +1106,90 @@ static void motion_zero(void)
                                     : "開機時杯子不是直立靜止，零點維持 0（傾斜角可能有幾度偏差）");
 }
 
+/* -------------------------------------------------------------------------- */
+/*  休眠                                                                        */
+/* -------------------------------------------------------------------------- */
+// 電腦的 USB 連著（收得到 SOF 封包）時不休眠：開發、校正時序列埠才不會斷。
+// 接行動電源或充電器不算連著，照樣會睡。
+static bool usb_host_connected(void)
+{
+#if SLEEP_ON_USB
+    return false;
+#else
+    return usb_serial_jtag_is_connected();
+#endif
+}
+
+// IMU 切到低功耗 wake-on-motion：只開加速度、低取樣率，晃動超過門檻就把 INT 拉高並閂鎖
+// （依 MPU-6500 / MPU-9250 datasheet 的 Wake-on-Motion 設定步驟）
+static esp_err_t imu_enter_wom(void)
+{
+    static const reg_val_t k_wom[] = {
+        { MPU_REG_PWR_MGMT_1,      0x01 },  // 喚醒、時脈自動選擇
+        { MPU_REG_PWR_MGMT_2,      0x07 },  // 關掉陀螺儀三軸，只留加速度
+        { MPU_REG_ACCEL_CONFIG2,   0x01 },  // ACCEL_FCHOICE_B=0、A_DLPF_CFG=1（184 Hz）
+        { MPU_REG_INT_PIN_CFG,     0x20 },  // 高電位有效、推挽、LATCH_INT_EN=1（INT 拉高後保持，直到讀 INT_STATUS）
+        { MPU_REG_INT_ENABLE,      0x40 },  // 只開 WOM 中斷
+        { MPU_REG_MOT_DETECT_CTRL, 0xC0 },  // ACCEL_INTEL_EN=1、ACCEL_INTEL_MODE=1
+        { MPU_REG_WOM_THR,         WOM_THRESHOLD },
+        { MPU_REG_LP_ACCEL_ODR,    WOM_LP_ODR },
+        { MPU_REG_PWR_MGMT_1,      0x21 },  // CYCLE=1：週期性醒來取樣，其餘時間睡
+    };
+    for (size_t i = 0; i < sizeof(k_wom) / sizeof(k_wom[0]); i++) {
+        esp_err_t err = reg_write(s_imu_dev, k_wom[i].reg, k_wom[i].val);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    return ESP_OK;
+}
+
+// 進入深度睡眠。醒來後會從 app_main 重新開始（RTC_DATA_ATTR 的變數會保留）
+static void enter_deep_sleep(uint32_t idle_ms)
+{
+    printf("\n[休眠] 已靜止 %" PRIu32 " 秒，進入深度睡眠（拿起杯子或 %d 分鐘後喚醒）\n",
+           idle_ms / 1000, SLEEP_TIMER_WAKE_S / 60);
+
+    ble_cup_shutdown();
+
+    // MPR121 進入停止模式（約 3 µA）；醒來後開機流程會重新設定
+    if (s_mpr_ready) {
+        (void)reg_write(s_mpr_dev, MPR121_REG_ECR, MPR121_ECR_STOP);
+    }
+
+    // IMU 改成 wake-on-motion。剛切換時，頭幾筆低功耗取樣會和初始參考值比較而觸發中斷
+    // （實測：沒處理的話一睡下去 0.4 秒就被叫醒），所以：
+    //   1. 先等 300 ms，讓 IMU 取完至少兩筆樣本（7.81 Hz → 每筆約 128 ms）
+    //   2. 讀 INT_STATUS 清掉閂鎖，再等超過一個取樣週期，確認 D1 維持低電位才睡；
+    //      又被拉高就再清一次，最多 10 次
+    bool wom_ok = imu_enter_wom() == ESP_OK;
+    vTaskDelay(pdMS_TO_TICKS(300));
+    bool int_low = false;
+    for (int i = 0; i < 10 && wom_ok; i++) {
+        uint8_t int_status = 0;
+        (void)reg_read(s_imu_dev, MPU_REG_INT_STATUS, &int_status, 1);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        if (gpio_get_level(PIN_IMU_INT) == 0) {
+            int_low = true;
+            break;
+        }
+    }
+    if (wom_ok && !int_low) {
+        printf("[休眠] D1 一直是高電位（杯子還在晃？），醒來後會再試\n");
+    }
+    if (wom_ok) {
+        esp_sleep_enable_ext1_wakeup_io(1ULL << PIN_IMU_INT, ESP_EXT1_WAKEUP_ANY_HIGH);
+    } else {
+        printf("[休眠] IMU wake-on-motion 設定失敗，只靠計時器喚醒\n");
+    }
+    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_TIMER_WAKE_S * 1000000ULL);
+
+    s_sleep_count++;
+    fflush(stdout);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    esp_deep_sleep_start();
+}
+
 // 欄寬（以終端機顯示寬度計算，中文字算 2 格）
 #define W_TIME   8
 #define W_E      6
@@ -1091,6 +1201,7 @@ static void motion_zero(void)
 #define W_MOVE   5
 #define W_BAT    7
 #define W_BLE    7
+#define W_SLEEP  6
 
 static void print_live_header(void)
 {
@@ -1113,8 +1224,9 @@ static void print_live_header(void)
     printf(" |");
     print_col("電池V", W_BAT, true);
     print_col("BLE", W_BLE, true);
+    print_col("休眠", W_SLEEP, true);
     printf("\n");
-    for (int i = 0; i < W_TIME + 2 * W_E + W_LEVEL + W_TOUCH + W_IRQ + 2 + 3 * W_ANG + W_POSE + W_MOVE + 2 + W_BAT + W_BLE; i++) {
+    for (int i = 0; i < W_TIME + 2 * W_E + W_LEVEL + W_TOUCH + W_IRQ + 2 + 3 * W_ANG + W_POSE + W_MOVE + 2 + W_BAT + W_BLE + W_SLEEP; i++) {
         putchar('-');
     }
     putchar('\n');
@@ -1144,6 +1256,8 @@ static void live_loop(void)
     cup_motion_t motion = { .pose = CUP_POSE_UNKNOWN };
     bool have_motion = false;
     cup_pose_t last_sent_pose = CUP_POSE_UNKNOWN;
+    bool was_connected = false;
+    uint32_t connected_at_ms = 0;
     bool have_e = false;
     uint16_t e0 = 0, e1 = 0;
     int bat_mv = -1;
@@ -1188,6 +1302,30 @@ static void live_loop(void)
             }
         }
 
+        // ---- 休眠判斷 ----
+        // 接著電腦 USB、或沒有 IMU（睡了就叫不醒）時不睡
+        bool usb = usb_host_connected();
+        ble_cup_state_t bst = ble_cup_state();
+        bool connected = (bst == BLE_CUP_CONNECTED || bst == BLE_CUP_SUBSCRIBED);
+        if (connected && !was_connected) {
+            connected_at_ms = now_ms;   // App 剛連上：從現在重新算閒置時間
+        }
+        was_connected = connected;
+        // 閒置時間 = 從「最後一次移動」或「App 連上」（取較晚的）到現在。
+        // 只看移動的話，水杯醒著靜止一陣子後 App 才連上，等待上限一換成「連線中」就會立刻睡
+        uint32_t idle_ms = motion.still_ms;
+        if (connected && now_ms - connected_at_ms < idle_ms) {
+            idle_ms = now_ms - connected_at_ms;
+        }
+        int32_t sleep_left_ms = -1;
+        if (have_motion && !usb) {
+            uint32_t limit = connected ? SLEEP_IDLE_CONNECTED_MS : SLEEP_IDLE_MS;
+            if (idle_ms >= limit) {
+                enter_deep_sleep(idle_ms);   // 不會返回
+            }
+            sleep_left_ms = (int32_t)(limit - idle_ms);
+        }
+
         // ---- 序列埠顯示 ----
         if (tick % PRINT_EVERY == 0) {
             if (row % LIVE_HEADER_EVERY == 0) {
@@ -1195,7 +1333,12 @@ static void live_loop(void)
             }
             char f_time[16], f_e0[8] = "--", f_e1[8] = "--", f_level[12] = "--", f_touch[16] = "--", f_irq[12] = "--";
             char f_p[12] = "--", f_r[12] = "--", f_t[12] = "--", f_pose[16] = "--", f_move[12] = "--";
-            char f_bat[12] = "--";
+            char f_bat[12] = "--", f_sleep[12] = "--";
+            if (usb) {
+                snprintf(f_sleep, sizeof(f_sleep), "USB");
+            } else if (sleep_left_ms >= 0) {
+                snprintf(f_sleep, sizeof(f_sleep), "%" PRId32 "s", (sleep_left_ms + 999) / 1000);
+            }
 
             snprintf(f_time, sizeof(f_time), "%.1f", now_ms / 1000.0);
             if (s_mpr_ready) {
@@ -1242,6 +1385,7 @@ static void live_loop(void)
             printf(" |");
             print_col(f_bat, W_BAT, true);
             print_col(ble_state_word(ble_cup_state()), W_BLE, true);
+            print_col(f_sleep, W_SLEEP, true);
             printf("\n");
             fflush(stdout);
             row++;
@@ -1257,14 +1401,27 @@ static void live_loop(void)
 /* ========================================================================== */
 void app_main(void)
 {
-    // USB Serial/JTAG：晶片重開後電腦要重新連上序列埠，先等一下以免開頭的輸出漏掉
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    // 這次開機是冷開機，還是從深度睡眠醒來（v6 起用 esp_sleep_get_wakeup_causes 的 bitmap）
+    uint32_t causes = esp_sleep_get_wakeup_causes();
+    bool by_motion = causes & BIT(ESP_SLEEP_WAKEUP_EXT1);
+    bool by_timer = causes & BIT(ESP_SLEEP_WAKEUP_TIMER);
+    s_woke_from_sleep = by_motion || by_timer;
+
+    // USB Serial/JTAG：晶片重開後電腦要重新連上序列埠，先等一下以免開頭的輸出漏掉。
+    // 從休眠醒來時跳過，盡快開始廣播
+    if (!s_woke_from_sleep) {
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
 
     printf("\n\n");
     print_rule('=');
     printf("  smart_cup 硬體接線測試（XIAO ESP32-C6）\n");
     printf("  SDA=D4(GPIO22)  SCL=D5(GPIO23)  IMU INT=D1(GPIO1)  MPR121 IRQ=D2(GPIO2)  電池=D0(GPIO0)\n");
     print_rule('=');
+    if (s_woke_from_sleep) {
+        printf("  從休眠喚醒（累計睡過 %" PRIu32 " 次）：%s\n", s_sleep_count,
+               by_motion ? "杯子被拿起或晃動（IMU → D1）" : "計時器定期喚醒");
+    }
 
     // GPIO 中斷服務（D1、D2 的計數都靠它）
     esp_err_t err = gpio_install_isr_service(0);
@@ -1280,11 +1437,29 @@ void app_main(void)
 
     printf("[3/6] IMU 識別與設定 …\n");
     test_imu_id();
-    printf("      IMU 靜止加速度（請讓板子保持不動）…\n");
-    test_imu_accel();
-
-    printf("[4/6] IMU INT 中斷計數 1 秒 …\n");
-    test_imu_int();
+    if (!s_woke_from_sleep) {
+        printf("      IMU 靜止加速度（請讓板子保持不動）…\n");
+        test_imu_accel();
+        printf("[4/6] IMU INT 中斷計數 1 秒 …\n");
+        test_imu_int();
+    } else {
+        // 醒來時杯子可能正在動，靜止測試沒意義；INT 測試要 1 秒，也略過。
+        // D1 仍要設成輸入（gpio_config 會把喚醒時用過的 LP IO 切回一般 GPIO），休眠前要讀它的電位
+        gpio_config_t io = {
+            .pin_bit_mask = 1ULL << PIN_IMU_INT,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_ENABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        (void)gpio_config(&io);
+        item_set(&s_items[IT_IMU_ACC], ST_MANUAL, "從休眠喚醒，略過");
+        if (by_motion) {
+            item_set(&s_items[IT_IMU_INT], ST_PASS, "D1 成功把 ESP32 從休眠叫醒");
+        } else {
+            item_set(&s_items[IT_IMU_INT], ST_MANUAL, "從休眠喚醒，略過");
+        }
+    }
 
     printf("[5/6] 電池電壓 …\n");
     test_battery();
@@ -1295,8 +1470,11 @@ void app_main(void)
     print_summary();
     printf("  提示：在 monitor 按 Ctrl+T 再按 Ctrl+R 可以重開機，重新跑一次測試\n");
 
-    // 姿態零點：開機時杯子應該直立放在桌上
-    motion_zero();
+    // 姿態零點：冷開機時杯子應該直立放在桌上。從休眠醒來時沿用 RTC 記憶體裡的零點
+    //（醒來時杯子可能拿在手上，不能重新歸零）
+    if (!s_woke_from_sleep || !cup_motion_has_zero()) {
+        motion_zero();
+    }
 
     // BLE：廣播 SmartCup-XXXX，App 連上並訂閱後開始推送水位、姿態
     err = ble_cup_init();

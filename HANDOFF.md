@@ -8,7 +8,18 @@
 - **已完成**：銅膠帶電極接上，即時顯示新增「水位%」欄（電極0 兩點直線校正）
 - **已完成**：BLE（NimBLE，`main/ble_gatt_svr.c`），協定跟 smart_cup_app 的 `cup_protocol.dart` 一致，另外新增 ATTITUDE（0x05）。用 `tools/ble_check.py` 和 App 實測都通過
 - **已完成**：姿態（俯仰／翻滾／傾斜、直立／傾斜／飲用中／倒下、移動判斷）與「水位只在直立靜止時更新」，在 `main/cup_state.c`
-- **還沒開始**：深度睡眠、RL 參考電極的 TI 比例算法、空杯自動重新校正
+- **已完成**：深度睡眠（README 第 6 節）。IMU wake-on-motion 接 D1（ext1 喚醒）＋每 30 分鐘計時器喚醒；接著電腦 USB 時不睡；零點與水位存 RTC 記憶體。App 端加了「找不到水杯時每 20 秒背景重試」
+- **還沒開始**：RL 參考電極的 TI 比例算法、空杯自動重新校正
+
+### 休眠實作備忘（2026-11-19 踩過的坑）
+
+- v6 起喚醒原因用 `esp_sleep_get_wakeup_causes()`（bitmap），舊的 `esp_sleep_get_wakeup_cause()` 已 deprecated；ext1 用 `esp_sleep_enable_ext1_wakeup_io()`，C6 的 GPIO 0～7 可用，每支腳可各自設定電位
+- **IMU 剛切到 wake-on-motion 時，頭幾筆低功耗取樣會觸發中斷**：沒處理的話一睡下去 0.4 秒就被叫醒。現在切換後等 300 ms，再清 INT_STATUS、等超過一個取樣週期（150 ms）確認 D1 是低電位才睡
+- **閒置時間要從「App 連上」重新算**：只看最後一次移動的話，水杯醒著靜止一陣子後 App 才連上，等待上限一換成「連線中」就會立刻睡
+- 喚醒路徑跳過 `test_imu_int`，但 D1 還是要 `gpio_config` 成輸入（它會呼叫 `rtc_gpio_deinit`，把喚醒用過的 LP IO 切回一般 GPIO）
+- **測休眠不要開序列埠**：打開序列埠（pyserial 設 DTR/RTS）會讓板子重開機，蓋掉喚醒狀態。改看 `/dev/ttyACM0` 在不在（睡著時 USB 斷開），或用 `tools/ble_watch.py` 看廣播
+- 測試版做法：暫時改 `SLEEP_ON_USB=1`、`SLEEP_TIMER_WAKE_S=45`，用 `idf.py -B build_sleeptest` 另外建置並燒錄，**燒錄完才把原始碼改回來**（`idf.py flash` 會先重新編譯，太早改回會燒到正式版）；測完刪掉 `build_sleeptest`（沒有被 .gitignore 涵蓋）
+- 舊的測試版韌體會自己睡著，燒錄前要等 `/dev/ttyACM0` 出現再馬上燒
 
 ### BLE 實作備忘
 
@@ -19,6 +30,7 @@
 - 廣播封包放不下名稱（flags 3 + UUID128 18 bytes），名稱 `SmartCup-XXXX` 放在 scan response
 - App 寫入用的是 write with response，characteristic 只開 `BLE_GATT_CHR_F_WRITE`
 - 這台開發機有藍牙（hci0），可以用 bleak 直接測；App 連著時電腦連不上
+- 電池接上後（2026-11-19）：開機測試電池項目通過（約 3.97 V），藍牙回報電量 70～80%
 
 ### 水位量測結果（2026-11-19 實測）
 

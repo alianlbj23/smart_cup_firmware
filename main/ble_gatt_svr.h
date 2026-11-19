@@ -48,6 +48,9 @@ void ble_cup_send_attitude(float pitch_deg, float roll_deg);
 // 更新電量（0～100，0xFF = 未知）；數值有變而且 App 有訂閱時會 Notify
 void ble_cup_set_battery(uint8_t pct);
 
+// 休眠前呼叫：主動斷開連線、停止廣播，App 會立刻知道水杯斷線（不必等連線逾時）
+void ble_cup_shutdown(void);
+
 // 統計（序列埠顯示用）
 uint32_t ble_cup_notify_count(void);
 uint32_t ble_cup_ack_count(void);

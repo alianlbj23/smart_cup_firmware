@@ -7,6 +7,8 @@
 #include <time.h>
 #include <sys/time.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nimble/nimble_port.h"
@@ -173,11 +175,15 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_conn = BLE_HS_CONN_HANDLE_NONE;
         s_data_sub = false;
         s_status_sub = false;
-        advertise();
+        if (s_started) {
+            advertise();
+        }
         return 0;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
-        advertise();
+        if (s_started) {
+            advertise();
+        }
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
@@ -371,6 +377,23 @@ void ble_cup_set_battery(uint8_t pct)
     if (om != NULL) {
         ble_gatts_notify_custom(conn, s_status_handle, om);
     }
+}
+
+void ble_cup_shutdown(void)
+{
+    if (!s_started) {
+        return;
+    }
+    s_started = false;   // 之後不再自動重新廣播
+    uint16_t conn = s_conn;
+    if (conn != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+        // 等斷線事件送出去（最多 300 ms）
+        for (int i = 0; i < 30 && s_conn != BLE_HS_CONN_HANDLE_NONE; i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    ble_gap_adv_stop();
 }
 
 ble_cup_state_t ble_cup_state(void)

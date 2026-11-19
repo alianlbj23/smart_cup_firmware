@@ -3,6 +3,8 @@
 #include <math.h>
 #include <stddef.h>
 
+#include "esp_attr.h"   // RTC_DATA_ATTR：深度睡眠時保留
+
 /* ========================================================================== */
 /*  可調參數                                                                    */
 /* ========================================================================== */
@@ -38,8 +40,11 @@
 /* ========================================================================== */
 /*  姿態                                                                        */
 /* ========================================================================== */
-static float s_pitch0, s_roll0;          // 開機零點（度）
-static float s_gx0, s_gy0, s_gz0;        // 陀螺儀偏移（度/秒）
+// 零點存在 RTC 記憶體：深度睡眠喚醒後沿用（醒來時杯子可能是拿在手上的，不能重新歸零）；
+// 拔電、重新燒錄等冷開機時會清成 0
+static RTC_DATA_ATTR float s_pitch0, s_roll0;        // 開機零點（度）
+static RTC_DATA_ATTR float s_gx0, s_gy0, s_gz0;      // 陀螺儀偏移（度/秒）
+static RTC_DATA_ATTR bool s_zero_valid;
 static uint32_t s_last_move_ms;
 static bool s_have_sample;
 static cup_pose_t s_pose = CUP_POSE_UNKNOWN;
@@ -72,7 +77,13 @@ bool cup_motion_set_zero(float ax, float ay, float az, float gx, float gy, float
     s_gx0 = gx;
     s_gy0 = gy;
     s_gz0 = gz;
+    s_zero_valid = true;
     return true;
+}
+
+bool cup_motion_has_zero(void)
+{
+    return s_zero_valid;
 }
 
 void cup_motion_update(float ax, float ay, float az, float gx, float gy, float gz,
@@ -135,8 +146,9 @@ const char *cup_pose_label(cup_pose_t pose)
 /* ========================================================================== */
 static uint16_t s_buf[WATER_AVG_N];
 static int s_buf_n, s_buf_pos;
-static bool s_have_water;
-static float s_water_pct;
+// 最後一次有效的水位存在 RTC 記憶體：喚醒後杯子還沒放穩前，App 也能先拿到上次的水位
+static RTC_DATA_ATTR bool s_have_water;
+static RTC_DATA_ATTR float s_water_pct;
 static bool s_holding = true;
 
 static float e0_to_pct(float e0)
