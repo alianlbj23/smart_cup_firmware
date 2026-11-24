@@ -5,7 +5,8 @@
  *   Service      3c8b0001-efc1-4061-946c-e5916790df93
  *   Time Sync    3c8b0002-…  App→杯  Write   Unix 秒數 uint32 LE
  *   Data Notify  3c8b0003-…  杯→App  Notify  type(1) + value(uint32 LE) + timestamp(uint32 LE) = 9 bytes
- *   ACK          3c8b0004-…  App→杯  Write   0x01 = 收到
+ *   ACK          3c8b0004-…  App→杯  Write   1 byte [0x01] = 收到（只計數）；
+ *                                              3 bytes [0x07, seq 低 8 bits, seq 高 3 bits] = 確認某一筆 DRINK_EVENT
  *   Device Status 3c8b0005-… 杯→App  Read/Notify  [電量 %（0xFF=未知）, 韌體 major, minor, patch]
  *
  * Data Notify 的 type：
@@ -14,7 +15,20 @@
  *   0x04 POSE     bits 15..0 = 傾斜角 0.1°（0～1800），bits 23..16 = 姿態代碼，bits 31..24 = 移動中
  *   0x05 ATTITUDE bits 15..0 = pitch int16 0.1°，bits 31..16 = roll int16 0.1°（App 不回 ACK）
  *   0x06 STATE    bits 7..0 = 狀態（0 活動中、1 休眠中），bits 31..8 = 進入目前狀態幾秒
- *                 狀態改變時、App 訂閱後立刻送；休眠中每 10 秒送一次
+ *                 狀態改變時、App 訂閱後 1.5 秒送；休眠中每 10 秒送一次
+ *   0x07 DRINK_EVENT（韌體 0.3.0 起）喝水／加水事件，偵測在 cup_state.c、存 flash 與補傳在 drink_log.c
+ *                 bits 7..0   = 拿起前水位 A，單位 0.5%（0～200）
+ *                 bits 15..8  = 放回後水位 B，單位 0.5%（0～200）
+ *                 bits 17..16 = 種類（0 喝水、1 加水，其他保留）
+ *                 bit 18      = saw_drinking（過程中出現過「飲用中」姿態）
+ *                 bit 19      = too_long（過程超過 10 分鐘）
+ *                 bit 20      = time_unknown（時間不可信，timestamp 填 0）
+ *                 bits 31..21 = seq（0～2047 循環）
+ *                 timestamp   = 事件開始時間（Unix 秒）
+ *                 App 收到後要寫 3-byte ACK，韌體才把它從 flash 刪除；沒收到 ACK 會重送（同一筆可能收到不只一次，
+ *                 App 要回 ACK 並自己去重）。連線中即時送，斷線時存著，重新訂閱 1.5 秒後依序補傳，一次只在途一筆
+ *
+ * 改協定時 App（smart_cup_app）的 lib/services/cup_protocol.dart 要同步改。
  *
  * 廣播名稱「SmartCup-XXXX」，XXXX = BLE 位址最後兩個 byte。
  */
@@ -25,10 +39,13 @@
 #include "esp_err.h"
 
 #define CUP_FW_MAJOR 0
-#define CUP_FW_MINOR 2
+#define CUP_FW_MINOR 3
 #define CUP_FW_PATCH 0
 
-// 初始化 NVS、NimBLE、GATT 服務並開始廣播
+// App 訂閱 Data Notify 後等多久才補送目前狀態與未確認的事件（太早送，App 可能還沒準備好接收而漏掉）
+#define SUBSCRIBE_RESEND_MS 1500
+
+// 初始化 NimBLE、GATT 服務並開始廣播（NVS 要先在 app_main 初始化好）
 esp_err_t ble_cup_init(void);
 
 typedef enum {
@@ -50,6 +67,16 @@ void ble_cup_send_attitude(float pitch_deg, float roll_deg);
 #define CUP_STATE_ACTIVE 0
 #define CUP_STATE_DOZING 1
 void ble_cup_send_state(uint8_t state, uint32_t seconds_in_state);
+
+// 送 0x07 DRINK_EVENT（value 由 cup_event_encode 產生，timestamp = 事件開始 Unix 秒或 0）。
+// 交給 NimBLE 成功回傳 true（不代表 App 收到，要等 ACK）
+bool ble_cup_send_drink_event(uint32_t value, uint32_t timestamp);
+
+// 取出一筆 App 寫來的 DRINK_EVENT ACK（seq）；沒有時回傳 false。只在主迴圈呼叫
+bool ble_cup_take_event_ack(uint16_t *seq);
+
+// App 每寫一次 Time Sync 就加 1（主程式用來判斷「剛對時」）
+uint32_t ble_cup_time_sync_count(void);
 
 // 休眠（淺眠）時呼叫 true：連線中改用長連線間隔（約 0.5～1 秒）、沒連線時放慢廣播（1 秒），省電但連線不斷；
 // 醒來呼叫 false 恢復

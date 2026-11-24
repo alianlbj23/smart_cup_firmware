@@ -2,7 +2,7 @@
 
 智慧水杯韌體。用貼在保護套內壁的銅膠帶電極，隔著玻璃杯量測水位。
 
-開機時自動檢查每個模組的接線，接著每 100 ms 量一次水位和姿態，透過 **BLE** 推送給手機 App [smart_cup_app](https://github.com/alianlbj23/smart_cup_app)，序列埠也會每 0.5 秒印一行數值。杯子靜止 30 秒就進入**休眠**省電（藍牙保持連線），拿起杯子就會醒來（見[第 6 節](#6-休眠)）。
+開機時自動檢查每個模組的接線，接著每 100 ms 量一次水位和姿態，透過 **BLE** 推送給手機 App [smart_cup_app](https://github.com/alianlbj23/smart_cup_app)，序列埠也會每 0.5 秒印一行數值。韌體自己偵測**喝水／加水**，存進 flash，App 沒連著時也不會漏（見[第 5 節](#喝水加水事件0x07)）。杯子靜止 30 秒就進入**休眠**省電（藍牙保持連線），拿起杯子就會醒來（見[第 6 節](#6-休眠)）。
 
 | 項目 | 內容 |
 |---|---|
@@ -73,7 +73,9 @@ ESP-IDF v6.1 由 EIM 安裝在 `~/.espressif/v6.1/esp-idf`。`idf.py` 預設不�
 source ~/.espressif/tools/activate_idf_v6.1.sh
 ```
 
-用 VS Code 的話，要開**本專案的資料夾**，不要開上一層。開錯的話，狀態列的建置、燒錄按鈕會在錯的目錄執行，出現「沒有 CMakeLists.txt」或「找不到 sdkconfig」的錯誤。
+Linux 和 macOS 都可以開發，ESP-IDF 都裝在 `~/.espressif/v6.1/esp-idf`，指令一樣，只有序列埠名稱不同：Linux 是 `/dev/ttyACM0`，Mac 是 `/dev/cu.usbmodem*`（下面的指令把 `-p` 換掉即可）。
+
+用 VS Code 的話，`.vscode/settings.json` 兩台共用：ESP-IDF 路徑寫成 `${env:HOME}/…`、序列埠設成 `detect`（自動偵測）。不要用「ESP-IDF: Select Current ESP-IDF Version」重新選版本，它會把路徑寫死成這台機器的。要開**本專案的資料夾**，不要開上一層。開錯的話，狀態列的建置、燒錄按鈕會在錯的目錄執行，出現「沒有 CMakeLists.txt」或「找不到 sdkconfig」的錯誤。
 
 ---
 
@@ -276,7 +278,7 @@ idf.py -p /dev/ttyACM0 flash monitor
 | `…0001` Service | | |
 | `…0002` Time Sync | App → 杯，Write | Unix 秒數（uint32 LE），連線後 App 會寫一次 |
 | `…0003` Data Notify | 杯 → App，Notify | 9 bytes：type(1) + value(uint32 LE) + 時間戳(uint32 LE) |
-| `…0004` ACK | App → 杯，Write | `0x01` = 收到 |
+| `…0004` ACK | App → 杯，Write | 1 byte `[0x01]` = 收到（只計數）；3 bytes `[0x07, seq 低 8 bits, seq 高 3 bits]` = 確認一筆 DRINK_EVENT，韌體收到才從 flash 刪除 |
 | `…0005` Device Status | 杯 → App，Read/Notify | `[電量 %, 韌體 major, minor, patch]`，電量 `0xFF` = 未知（沒接電池） |
 
 | type | 名稱 | 頻率 | value |
@@ -285,9 +287,67 @@ idf.py -p /dev/ttyACM0 flash monitor
 | `0x04` | POSE | 1 次/秒，姿態改變時立刻送（休眠中不送） | bits 15..0 = 傾斜角 0.1°，bits 23..16 = 姿態（1 直立、2 傾斜、3 飲用中、4 倒下），bits 31..24 = 移動中 |
 | `0x05` | ATTITUDE | 5 次/秒（休眠中不送） | bits 15..0 = pitch（int16，0.1°），bits 31..16 = roll（int16，0.1°）。即時資料，App 不回 ACK |
 | `0x06` | STATE | 狀態改變時、App 訂閱後 1.5 秒；休眠中每 10 秒 | bits 7..0 = 狀態（0 活動中、1 休眠中），bits 31..8 = 進入目前狀態幾秒 |
+| `0x07` | DRINK_EVENT | 每筆事件；連線中即時送，斷線時存 flash、重新訂閱後補傳（休眠中也會） | 見下方「喝水／加水事件」。時間戳 = 事件開始時間，不是送出時間 |
 | `0x03` | RAW | 目前不送 | 電極0 讀值，除錯用 |
 
 開機後還沒量到有效水位之前（約 1 秒），不會送 WATER。
+
+### 喝水／加水事件（0x07）
+
+韌體 **0.3.0** 起，喝水／加水由韌體偵測（[main/cup_state.c](main/cup_state.c)），韌體是唯一的事件來源。App 看到 Device Status 的版本 ≥ 0.3.0 就要關掉自己的偵測，否則會重複計算。
+
+**偵測規則**（和 App 的 `lib/state/drink_detector.dart` 一致）：
+
+- **穩定**：直立、不在移動，持續 3 秒以上。穩定時的水位是基準 A，穩定期間基準跟著水位走（慢慢漂移、杯子放著不動時倒水進去，都只更新基準，不產生事件）。
+- **過程**：離開穩定（傾斜、飲用中、倒下、移動中）就開始一段過程，記下開始時間、過程中有沒有出現「飲用中」姿態。放下不到 3 秒又拿起，算同一段。
+- **結算**：再次穩定得到水位 B。A − B ≥ 3% → 喝水；B − A ≥ 3% → 加水；其他當雜訊。不論有沒有事件，基準都改成 B。
+- 過程超過 10 分鐘照樣產生事件，但帶 `too_long`。剛開機還沒有基準時，第一次穩定只建立基準。
+- **休眠中**：進入休眠時是直立靜止的話，休眠中量到的水位只更新基準，不產生事件；喚醒視為離開穩定。
+- **待確認由 App 決定**：韌體只送原始旗標。喝水但沒有 `saw_drinking`（可能是倒掉）、加水但有 `saw_drinking`（可能喝了又裝水）、`too_long`，App 都標成待確認。
+
+**value（uint32 LE）**：
+
+| bits | 內容 |
+|---|---|
+| 7..0 | 拿起前水位 A，單位 0.5%（0～200） |
+| 15..8 | 放回後水位 B，單位 0.5%（0～200） |
+| 17..16 | 種類：0 = 喝水、1 = 加水，其他保留 |
+| 18 | `saw_drinking`：過程中出現過「飲用中」姿態 |
+| 19 | `too_long`：過程超過 10 分鐘 |
+| 20 | `time_unknown`：時間不可信，timestamp 填 0（App 用收到的時間，記成待確認） |
+| 31..21 | seq（11 bits，0～2047 循環），ACK 用 |
+
+韌體只有水位比例（%），沒有 mL 概念；mL = 水位比例 × 容量，容量在 App 設定。
+
+**ACK 與補傳**（[main/drink_log.c](main/drink_log.c)）：
+
+1. 產生事件時先寫進 flash（NVS），有連線而且已訂閱就立刻送出。
+2. App 收到後寫 ACK characteristic 3 bytes `[0x07, seq & 0xFF, (seq >> 8) & 0x07]`。韌體收到相符的 ACK 才從 flash 刪除。舊 App 只回 1 byte `[0x01]`，不影響事件，事件會一直留在 flash（滿了丟最舊的），這是預期行為。
+3. App 訂閱後 1.5 秒（`SUBSCRIBE_RESEND_MS`）開始依序補傳所有未確認的事件，一次只在途一筆：送出後等 ACK 2 秒（休眠中 6 秒），逾時重送；同一筆重送 3 次還沒 ACK，這次連線就先暫停，下次連線再試（有新事件時會再試一次）。
+4. ACK 晚到時同一筆可能收到兩次，**App 要照樣回 ACK，並用 seq + 時間戳 + A/B 去重**。seq 在清空 flash 後會從 0 重新開始。
+5. flash 最多存 256 筆未確認的事件（`EVT_STORE_MAX`），滿了丟最舊的，序列埠會印警告。拔電、重新燒錄（沒有清 flash）後還在。
+
+**時間**：水杯沒有 RTC 晶片，時間只靠 App 的 Time Sync。對時後產生的事件直接記 Unix 秒。對時前產生的事件，如果是**同一次開機**，在對時當下用「對時的 Unix 秒 −（對時當下的開機秒數 − 事件的開機秒數）」換算；換算不了的（之前開機留下的，例如對時前就斷電），送出時帶 `time_unknown`、timestamp = 0。
+
+**可調參數**：
+
+| 參數 | 位置 | 預設 | 說明 |
+|---|---|---|---|
+| `EVT_SETTLE_MS` | cup_state.c | 3000 | 直立、不在移動持續多久算穩定（ms） |
+| `EVT_MIN_DELTA_PCT` | cup_state.c | 3.0 | 水位變化多少（%）才算事件；電極解析度約 2% |
+| `EVT_MAX_EPISODE_MS` | cup_state.c | 600000 | 過程超過多久帶 `too_long`（10 分鐘） |
+| `EVT_STORE_MAX` | drink_log.c | 256 | flash 最多存幾筆未確認的事件（2 的次方、≤ 1024） |
+| `EVT_ACK_TIMEOUT_MS` / `EVT_ACK_TIMEOUT_DOZE_MS` | drink_log.c | 2000 / 6000 | 等 ACK 多久就重送（活動中／休眠中） |
+| `EVT_MAX_RETRY` | drink_log.c | 3 | 同一筆重送幾次沒 ACK 就暫停到下次連線 |
+| `SUBSCRIBE_RESEND_MS` | ble_gatt_svr.h | 1500 | App 訂閱後多久開始補送狀態與事件 |
+
+序列埠會印 `[事件] 喝水 62.0% → 55.5%（seq 12，有飲用姿態，8 秒前開始）已存進 flash`、`[事件] seq 12 已確認，從 flash 刪除`、`[事件] App 已訂閱，1.5 秒後補傳 3 筆未確認的事件` 等訊息；每 20 行重印的表頭會顯示目前的基準水位和未確認事件筆數。
+
+偵測邏輯可以在電腦上跑單元測試（不需要 ESP-IDF）：
+
+```bash
+sh test/host/run.sh
+```
 
 ### 姿態怎麼判斷
 
@@ -307,11 +367,12 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 ### 用電腦測試 BLE（不用 App）
 
-[tools/ble_check.py](tools/ble_check.py) 會模擬 App 的流程：掃描 `SmartCup-`、對時、讀電量、訂閱資料、回 ACK，最後統計收到的封包。電腦要有藍牙，先裝 [bleak](https://pypi.org/project/bleak/)：
+[tools/ble_check.py](tools/ble_check.py) 會模擬 App 的流程：掃描 `SmartCup-`、對時、讀電量、訂閱資料、回 ACK（DRINK_EVENT 回 3-byte ACK），最後統計收到的封包。每一筆 DRINK_EVENT 都會印出種類、A → B、旗標、seq、時間。電腦要有藍牙，先裝 [bleak](https://pypi.org/project/bleak/)：
 
 ```bash
 python3 -m venv ~/blevenv && ~/blevenv/bin/pip install bleak
-~/blevenv/bin/python tools/ble_check.py 10     # 收 10 秒
+~/blevenv/bin/python tools/ble_check.py 10            # 收 10 秒
+~/blevenv/bin/python tools/ble_check.py 30 --no-ack   # 故意不回 0x07 的 ACK，測重送與下次連線補傳
 ```
 
 正常的輸出（10 秒內 WATER、POSE 各約 10 筆，ATTITUDE 約 50 筆）：
@@ -319,7 +380,7 @@ python3 -m venv ~/blevenv && ~/blevenv/bin/pip install bleak
 ```
 找到 SmartCup-E0CE 58:E6:C5:12:E0:CE
 Service 存在: True
-Device Status: [255, 0, 2, 0]（電量 未知，韌體 0.2.0）
+Device Status: [255, 0, 3, 0]（電量 未知，韌體 0.3.0）
 10 秒內收到： {'0x02': 10, '0x04': 10, '0x05': 50}
   最後一筆 WATER 61.14% 刻度 6
   最後一筆 POSE 直立 傾斜 0.2° 移動 0
@@ -344,6 +405,7 @@ App 連著水杯時，電腦連不上（一次只能連一個）。
 | 水位 | 每秒送 | 每 5 秒量一次，變化 ≥ 1% 立刻送，否則每 30 秒送一次（加水時杯子不一定會動） |
 | 姿態 | POSE 每秒、ATTITUDE 每秒 5 次 | 不送 |
 | STATE（0x06） | 狀態改變、App 訂閱後送 | 每 10 秒送一次，讓 App 知道還在休眠 |
+| 喝水事件（0x07） | 偵測到就存 flash 並立刻送；訂閱後補傳未確認的 | 不產生新事件（直立時水位變化只更新基準）；**照樣補傳未確認的事件、處理 ACK**（ACK 逾時放寬到 6 秒） |
 
 - **什麼時候休眠**：從「最後一次移動」或「App 連上」（取較晚的）起算，靜止 30 秒。App 剛連上時一定先有 30 秒即時資料。
 - **什麼時候醒**：拿起或晃動杯子，D1 被 IMU 拉高，250 ms 內恢復，App 收到 STATE「活動中」後畫面回到即時模式。
@@ -360,7 +422,7 @@ App 連著水杯時，電腦連不上（一次只能連一個）。
 
 ### 深度睡眠（預設關閉）
 
-把 [main/main.c](main/main.c) 的 `DEEP_SLEEP_ENABLE` 改成 1 之後：休眠中**沒有 App 連線**超過 30 分鐘（`DEEP_SLEEP_AFTER_MS`），就進深度睡眠，藍牙關閉，非常省電。拿起杯子（IMU → D1，ext1 喚醒）或每 30 分鐘（`SLEEP_TIMER_WAKE_S`）會醒來。醒來後零點和水位從 RTC 記憶體沿用；App 找不到水杯時會每 20 秒背景重試，醒來後自動連回。接著電腦 USB 時不會進深度睡眠。
+把 [main/main.c](main/main.c) 的 `DEEP_SLEEP_ENABLE` 改成 1 之後：休眠中**沒有 App 連線**超過 30 分鐘（`DEEP_SLEEP_AFTER_MS`），就進深度睡眠，藍牙關閉，非常省電。拿起杯子（IMU → D1，ext1 喚醒）或每 30 分鐘（`SLEEP_TIMER_WAKE_S`）會醒來。醒來後零點、水位、喝水偵測的基準與進行中的過程從 RTC 記憶體沿用（未確認的事件本來就在 flash）；App 找不到水杯時會每 20 秒背景重試，醒來後自動連回。接著電腦 USB 時不會進深度睡眠。
 
 ### 參數
 
@@ -371,7 +433,7 @@ App 連著水杯時，電腦連不上（一次只能連一個）。
 | `DOZE_IDLE_MS` | 30000 | 靜止多久就休眠（ms） |
 | `DOZE_KEEPALIVE_MS` | 10000 | 休眠中多久送一次 STATE |
 | `DOZE_WATER_CHECK_MS` / `DOZE_WATER_FORCE_MS` / `DOZE_WATER_DELTA_PCT` | 5000 / 30000 / 1.0 | 休眠中量水位的間隔、沒變化時多久送一次、變化多少就立刻送 |
-| `SUBSCRIBE_RESEND_MS` | 1500 | App 訂閱後多久補送目前狀態 |
+| `SUBSCRIBE_RESEND_MS` | 1500 | App 訂閱後多久補送目前狀態與未確認的事件（在 [main/ble_gatt_svr.h](main/ble_gatt_svr.h)） |
 | `WOM_THRESHOLD` | 12 | 晃動喚醒門檻，單位 4 mg（12 = 48 mg）。太敏感就調大 |
 | `WOM_LP_ODR` | 5 | 休眠時 IMU 的取樣率代碼（5 = 7.81 Hz） |
 | `DEEP_SLEEP_ENABLE` | 0 | 1 = 休眠中沒連線太久就進深度睡眠 |
@@ -400,12 +462,14 @@ BLE 的連線間隔在 [main/ble_gatt_svr.c](main/ble_gatt_svr.c) 的 `k_conn_fa
 
 ```
 main/main.c          接線測試、即時量測迴圈、序列埠顯示、休眠（淺眠／深度睡眠）、MPR121／IMU／電池讀取
-main/cup_state.c/.h  水位換算與保持、姿態（俯仰／翻滾／傾斜、分類、移動判斷）、電量 %
-main/ble_gatt_svr.c/.h  BLE GATT Server（NimBLE）：廣播、對時、Data Notify、Device Status
+main/cup_state.c/.h  水位換算與保持、姿態（俯仰／翻滾／傾斜、分類、移動判斷）、喝水／加水事件偵測、電量 %（純計算）
+main/drink_log.c/.h  喝水事件存 flash（NVS 環形佇列）、ACK、對時換算、補傳
+main/ble_gatt_svr.c/.h  BLE GATT Server（NimBLE）：廣播、對時、Data Notify、ACK、Device Status
 main/CMakeLists.txt  用到的 ESP-IDF 元件（esp_driver_i2c、esp_driver_gpio、esp_adc、esp_timer、bt、nvs_flash、esp_driver_usb_serial_jtag、esp_pm）
 sdkconfig.defaults   主控台走 USB Serial/JTAG、4MB Flash、NimBLE、電源管理（自動淺眠）
 tools/read_levels.py 校正用：錄一段電極讀值並算平均
-tools/ble_check.py   用電腦模擬 App 測試 BLE
+tools/ble_check.py   用電腦模擬 App 測試 BLE（含 0x07 的 ACK；--no-ack 測重送）
+test/host/           cup_state.c 事件偵測的單元測試，在電腦上跑（sh test/host/run.sh）
 tools/ble_watch.py   休眠測試：印出 BLE 廣播出現／消失的時間軸
 docs/wiring.pdf      接線圖、電極尺寸、接線順序
 HANDOFF.md           開發交接筆記（ESP-IDF v6 注意事項、已踩過的坑）

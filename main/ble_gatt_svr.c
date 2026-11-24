@@ -9,8 +9,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
-#include "nvs_flash.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -37,6 +37,7 @@ static const ble_uuid128_t k_status_uuid = CUP_UUID(0x05);
 #define MSG_POSE      0x04
 #define MSG_ATTITUDE  0x05
 #define MSG_STATE     0x06
+#define MSG_DRINK_EVT 0x07
 #define DATA_LEN      9
 #define FILL25_MAX    ((1u << 25) - 1)
 
@@ -56,6 +57,10 @@ static volatile uint8_t s_battery = 0xFF;
 static volatile uint32_t s_notify_count, s_ack_count;
 static volatile uint32_t s_subscribe_count;
 static volatile bool s_low_power;
+static volatile uint32_t s_time_sync_count;
+// 0x07 的 ACK：在 NimBLE host task 收到，用 queue 交給主迴圈（drink_log.c）處理，不必加鎖
+#define EVT_ACK_QUEUE_LEN 16
+static QueueHandle_t s_evt_ack_q;
 
 // 連線參數（間隔單位 1.25 ms、逾時單位 10 ms）
 static const struct ble_gap_upd_params k_conn_fast = {
@@ -126,6 +131,7 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
             printf("[BLE] 對時完成：Unix %" PRIu32 "（UTC %04d-%02d-%02d %02d:%02d:%02d）\n", ts,
                    tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday,
                    tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec);
+            s_time_sync_count++;   // 主迴圈看到計數變了，就幫對時前的事件換算時間
             return 0;
         }
         if (which == CHR_ACK) {
@@ -133,6 +139,14 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
                 return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
             }
             s_ack_count++;
+            // 3 bytes [0x07, seq 低 8 bits, seq 高 3 bits] = 確認收到某一筆 DRINK_EVENT；
+            // 其他（舊 App 的 1 byte [0x01]）只計數
+            if (len == 3 && buf[0] == MSG_DRINK_EVT && s_evt_ack_q != NULL) {
+                uint16_t seq = (uint16_t)(buf[1] | ((buf[2] & 0x07) << 8));
+                if (xQueueSend(s_evt_ack_q, &seq, 0) != pdTRUE) {
+                    printf("[BLE] 事件 ACK 佇列滿了，seq %u 的 ACK 丟掉（之後會重送）\n", (unsigned)seq);
+                }
+            }
             return 0;
         }
         return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
@@ -311,17 +325,13 @@ static void host_task(void *param)
 
 esp_err_t ble_cup_init(void)
 {
-    // NVS：BLE 控制器要用來存 PHY 校正資料
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        err = nvs_flash_init();
-    }
-    if (err != ESP_OK) {
-        return err;
+    // NVS（BLE 控制器存 PHY 校正資料要用）已經在 app_main 一開始初始化過
+    s_evt_ack_q = xQueueCreate(EVT_ACK_QUEUE_LEN, sizeof(uint16_t));
+    if (s_evt_ack_q == NULL) {
+        return ESP_ERR_NO_MEM;
     }
 
-    err = nimble_port_init();
+    esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
         return err;
     }
@@ -350,23 +360,31 @@ esp_err_t ble_cup_init(void)
 /* ========================================================================== */
 /*  送資料                                                                      */
 /* ========================================================================== */
-static void notify_data(uint8_t type, uint32_t value)
+// 送出成功（交給 NimBLE）回傳 true；沒連線、沒訂閱或記憶體不足回傳 false
+static bool notify_data_ts(uint8_t type, uint32_t value, uint32_t timestamp)
 {
     uint16_t conn = s_conn;
     if (conn == BLE_HS_CONN_HANDLE_NONE || !s_data_sub) {
-        return;
+        return false;
     }
     uint8_t buf[DATA_LEN];
     buf[0] = type;
     put_u32(&buf[1], value);
-    put_u32(&buf[5], (uint32_t)time(NULL));   // 對時前是開機後的秒數
+    put_u32(&buf[5], timestamp);
     struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, sizeof(buf));
     if (om == NULL) {
-        return;
+        return false;
     }
-    if (ble_gatts_notify_custom(conn, s_data_handle, om) == 0) {   // om 由 NimBLE 釋放
-        s_notify_count++;
+    if (ble_gatts_notify_custom(conn, s_data_handle, om) != 0) {   // om 由 NimBLE 釋放
+        return false;
     }
+    s_notify_count++;
+    return true;
+}
+
+static void notify_data(uint8_t type, uint32_t value)
+{
+    (void)notify_data_ts(type, value, (uint32_t)time(NULL));   // 對時前是開機後的秒數
 }
 
 static int16_t to_deci(float deg, float limit)
@@ -427,6 +445,21 @@ void ble_cup_send_state(uint8_t state, uint32_t seconds_in_state)
         seconds_in_state = 0xFFFFFF;
     }
     notify_data(MSG_STATE, (uint32_t)state | (seconds_in_state << 8));
+}
+
+bool ble_cup_send_drink_event(uint32_t value, uint32_t timestamp)
+{
+    return notify_data_ts(MSG_DRINK_EVT, value, timestamp);
+}
+
+bool ble_cup_take_event_ack(uint16_t *seq)
+{
+    return s_evt_ack_q != NULL && xQueueReceive(s_evt_ack_q, seq, 0) == pdTRUE;
+}
+
+uint32_t ble_cup_time_sync_count(void)
+{
+    return s_time_sync_count;
 }
 
 void ble_cup_set_low_power(bool on)

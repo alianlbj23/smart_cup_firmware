@@ -8,11 +8,12 @@
  *
  * 開機後全自動執行，不需要從 monitor 輸入任何東西：
  *   第一部分：每個項目自動測一次，最後印出總結表（通過／失敗，失敗時列出該檢查的線）
- *   第二部分：每 100 ms 讀一次感測器，算水位、姿態，透過 BLE 推送給 App（ble_gatt_svr.c），
- *             序列埠每 0.5 秒印一行
+ *   第二部分：每 100 ms 讀一次感測器，算水位、姿態，偵測喝水／加水事件，透過 BLE 推送給 App
+ *             （ble_gatt_svr.c），序列埠每 0.5 秒印一行
+ *   靜止 30 秒進入休眠（淺眠，BLE 連線不斷）；深度睡眠是選項（DEEP_SLEEP_ENABLE，預設關閉）
  *
- * 水位、姿態的計算在 cup_state.c（水位校正值 LEVEL_E0_EMPTY / LEVEL_E0_FULL 也在那裡）。
- * 還沒有深度睡眠。
+ * 水位、姿態、喝水／加水事件的計算在 cup_state.c（水位校正值 LEVEL_E0_EMPTY / LEVEL_E0_FULL 也在那裡）；
+ * 事件存 flash、補傳給 App 在 drink_log.c。
  * 依 ESP-IDF v6.1 的 API 撰寫（新版 I2C 驅動 driver/i2c_master.h、esp_adc oneshot + 校正、NimBLE）。
  */
 
@@ -37,9 +38,11 @@
 #include "esp_sleep.h"
 #include "esp_pm.h"
 #include "driver/usb_serial_jtag.h"
+#include "nvs_flash.h"
 
 #include "cup_state.h"
 #include "ble_gatt_svr.h"
+#include "drink_log.h"
 
 /* ========================================================================== */
 /*  腳位（XIAO ESP32-C6 的 Dx 標示 → GPIO 編號）                                */
@@ -86,7 +89,6 @@
 #define DOZE_IDLE_MS            30000   // 靜止 30 秒就休眠（從最後一次移動或 App 連上算起，取較晚的）
 #endif
 #define DOZE_POLL_MS            250     // 休眠中每 250 ms 看一次 D1（IMU 的 INT 是閂鎖的，不會漏掉）
-#define SUBSCRIBE_RESEND_MS     1500    // App 訂閱後等 1.5 秒再補送目前狀態（太早送，App 可能還沒準備好接收而漏掉）
 #define DOZE_KEEPALIVE_MS       10000   // 休眠中每 10 秒送一次 STATE，讓 App 知道還在休眠
 #define DOZE_WATER_CHECK_MS     5000    // 休眠中每 5 秒量一次水位
 #define DOZE_WATER_FORCE_MS     30000   // 水位沒變也每 30 秒送一次
@@ -1206,7 +1208,8 @@ static uint32_t uptime_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-// 休眠中量水位：連讀 10 筆（每筆隔 20 ms）餵給 cup_state 平均。杯子不是直立時不更新水位
+// 休眠中量水位：連讀 10 筆（每筆隔 20 ms）餵給 cup_state 平均。杯子不是直立時不更新水位。
+// 直立時休眠中的讀值視為「穩定」：只更新喝水偵測的基準，不產生事件（例如杯子放著不動時有人倒水進去）
 static void doze_measure_water(bool upright)
 {
     if (!s_mpr_ready) {
@@ -1218,6 +1221,10 @@ static void doze_measure_water(bool upright)
             cup_water_add_sample(e0, upright);
         }
         vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    float pct;
+    if (upright && cup_water_get(&pct) && !cup_water_holding()) {
+        cup_event_doze_water(pct);
     }
 }
 
@@ -1246,6 +1253,9 @@ static void doze_loop(uint32_t idle_ms, const cup_motion_t *last)
         vTaskDelay(pdMS_TO_TICKS(DOZE_POLL_MS));
         uint32_t now = uptime_ms();
         uint32_t secs = (now - start) / 1000;
+
+        // 休眠中也要處理事件的 ACK 與補傳（App 可能在休眠中連上）
+        drink_log_poll(true);
 
         // App 剛連上／訂閱：1.5 秒後補送「休眠中」、最新水位和休眠前最後的姿態，
         // App 一連上就有完整畫面（休眠中平常不送姿態）
@@ -1297,6 +1307,7 @@ static void doze_loop(uint32_t idle_ms, const cup_motion_t *last)
     uint32_t dozed_s = (uptime_ms() - start) / 1000;
     test_imu_id();
     cup_motion_mark_moving(uptime_ms());
+    cup_event_wake(drink_log_clock_ms());   // 喚醒 = 杯子被動到，視為離開穩定
     ble_cup_set_low_power(false);
     ble_cup_send_state(CUP_STATE_ACTIVE, 0);
     printf("[休眠] 偵測到移動，喚醒（休眠了 %" PRIu32 " 秒）\n", dozed_s);
@@ -1319,8 +1330,15 @@ static void print_live_header(void)
 {
     printf("\n");
     print_compact_summary();
+    float base;
+    char f_base[16] = "--";
+    if (cup_event_baseline(&base)) {
+        snprintf(f_base, sizeof(f_base), "%.1f%%", base);
+    }
     printf("BLE 名稱：%s　｜　水位只在直立靜止時更新，「水位%%」後面的 * 代表沿用上一次的值\n",
            ble_cup_name()[0] ? ble_cup_name() : "（BLE 未啟動）");
+    printf("喝水偵測：基準水位 %s%s　｜　未確認的事件 %" PRIu32 " 筆（App 回 ACK 後才從 flash 刪除）\n",
+           f_base, cup_event_in_episode() ? "（杯子拿起中）" : "", drink_log_pending());
     print_col("時間(s)", W_TIME, true);
     print_col("電極0", W_E, true);
     print_col("電極1", W_E, true);
@@ -1395,6 +1413,17 @@ static void live_loop(void)
                 cup_water_add_sample(e0, have_motion ? motion.water_ok : true);
             }
         }
+
+        // ---- 喝水／加水事件（沒有 IMU 時看不出拿起放下，不偵測）----
+        if (have_motion) {
+            float wpct = 0.0f;
+            bool fresh = cup_water_get(&wpct) && !cup_water_holding();
+            cup_event_t ev;
+            if (cup_event_update(motion.pose, motion.moving, fresh, wpct, drink_log_clock_ms(), &ev)) {
+                drink_log_add(&ev);   // 先存 flash，有連線就立刻送 0x07
+            }
+        }
+        drink_log_poll(false);
         if (tick % BATTERY_EVERY == 0) {
             int pin_mv;
             bat_mv = battery_read(&pin_mv, &bat_mv) ? bat_mv : -1;
@@ -1535,6 +1564,16 @@ void app_main(void)
     bool by_timer = causes & BIT(ESP_SLEEP_WAKEUP_TIMER);
     s_woke_from_sleep = by_motion || by_timer;
 
+    // NVS：喝水事件（drink_log.c）和 BLE 控制器的 PHY 校正資料都存在這裡，整個程式只初始化這一次。
+    // 格式不相容時清掉重來（未確認的事件會不見，正常只有改分割表或 IDF 大改版才會發生）
+    esp_err_t nvs_err = nvs_flash_init();
+    bool nvs_erased = false;
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_err = nvs_flash_init();
+        nvs_erased = true;
+    }
+
     // USB Serial/JTAG：晶片重開後電腦要重新連上序列埠，先等一下以免開頭的輸出漏掉。
     // 從休眠醒來時跳過，盡快開始廣播
     if (!s_woke_from_sleep) {
@@ -1546,6 +1585,11 @@ void app_main(void)
     printf("  smart_cup 硬體接線測試（XIAO ESP32-C6）\n");
     printf("  SDA=D4(GPIO22)  SCL=D5(GPIO23)  IMU INT=D1(GPIO1)  MPR121 IRQ=D2(GPIO2)  電池=D0(GPIO0)\n");
     print_rule('=');
+    if (nvs_err != ESP_OK) {
+        printf("  警告：NVS 初始化失敗（%s），喝水事件不會存進 flash、BLE 可能也起不來\n", esp_err_to_name(nvs_err));
+    } else if (nvs_erased) {
+        printf("  警告：NVS 格式不相容，已清空（之前未確認的喝水事件不見了）\n");
+    }
     if (s_woke_from_sleep) {
         printf("  從休眠喚醒（累計睡過 %" PRIu32 " 次）：%s\n", s_sleep_count,
                by_motion ? "杯子被拿起或晃動（IMU → D1）" : "計時器定期喚醒");
@@ -1617,6 +1661,11 @@ void app_main(void)
         printf("  電源管理設定失敗（%s），不會自動淺眠\n", esp_err_to_name(err));
     }
 #endif
+
+    // 喝水事件：載入 flash 裡還沒被 App 確認的事件（BLE 啟動前，一連上就能補傳）
+    if (nvs_err == ESP_OK) {
+        drink_log_init(s_woke_from_sleep);
+    }
 
     // BLE：廣播 SmartCup-XXXX，App 連上並訂閱後開始推送水位、姿態
     err = ble_cup_init();

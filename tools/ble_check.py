@@ -1,5 +1,11 @@
-"""模擬 App 的 BLE 流程：掃描 → 連線 → 對時 → 讀電量 → 訂閱 → 收封包並 ACK（ATTITUDE 不 ACK）→ 統計。"""
-import asyncio, struct, sys, time
+"""模擬 App 的 BLE 流程：掃描 → 連線 → 對時 → 讀電量 → 訂閱 → 收封包並 ACK（ATTITUDE 不 ACK）→ 統計。
+
+DRINK_EVENT（0x07）每一筆都印出來，並回 3-byte ACK [0x07, seq 低 8 bits, seq 高 3 bits]，韌體收到才從 flash 刪除。
+
+  python tools/ble_check.py 10            # 收 10 秒
+  python tools/ble_check.py 30 --no-ack   # 故意不回 0x07 的 ACK：測重送（2 秒逾時、最多重試 3 次）與下次連線補傳
+"""
+import argparse, asyncio, struct, sys, time
 from collections import Counter
 from bleak import BleakScanner, BleakClient
 
@@ -9,7 +15,33 @@ DATA = "3c8b0003-efc1-4061-946c-e5916790df93"
 ACK = "3c8b0004-efc1-4061-946c-e5916790df93"
 STATUS = "3c8b0005-efc1-4061-946c-e5916790df93"
 POSES = ["未知", "直立", "傾斜", "飲用中", "倒下"]
-SECONDS = float(sys.argv[1]) if len(sys.argv) > 1 else 10
+MSG_DRINK_EVENT = 0x07
+
+ap = argparse.ArgumentParser(description="用電腦模擬 App 測試 SmartCup BLE")
+ap.add_argument("seconds", nargs="?", type=float, default=10, help="收幾秒（預設 10）")
+ap.add_argument("--no-ack", action="store_true", help="不回 DRINK_EVENT（0x07）的 3-byte ACK，測試重送與斷線補傳")
+ARGS = ap.parse_args()
+SECONDS = ARGS.seconds
+
+
+def fmt_time(ts: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def decode_drink_event(v: int, ts: int) -> str:
+    a = (v & 0xFF) / 2
+    b = ((v >> 8) & 0xFF) / 2
+    kind = {0: "喝水", 1: "加水"}.get((v >> 16) & 0x3, f"保留({(v >> 16) & 0x3})")
+    saw = (v >> 18) & 1
+    too_long = (v >> 19) & 1
+    time_unknown = (v >> 20) & 1
+    seq = v >> 21
+    flags = []
+    flags.append("有飲用姿態" if saw else "沒有飲用姿態")
+    if too_long:
+        flags.append("過程太久")
+    when = "時間未知" if time_unknown else f"開始 {fmt_time(ts)}"
+    return f"DRINK_EVENT seq {seq} {kind} {a:.1f}% → {b:.1f}%（{'、'.join(flags)}，{when}）"
 
 
 def decode(b: bytes):
@@ -27,6 +59,8 @@ def decode(b: bytes):
     if t == 6:
         state = {0: "活動中", 1: "休眠中"}.get(v & 0xFF, f"未知({v & 0xFF})")
         return t, f"STATE {state}（已 {v >> 8} 秒）", ts
+    if t == MSG_DRINK_EVENT:
+        return t, decode_drink_event(v, ts), ts
     return t, f"type 0x{t:02x} value {v}", ts
 
 
@@ -48,18 +82,30 @@ async def main():
         counts = Counter()
         last = {}
         first_ts = []
+        drink_seen = {}
 
         t_start = time.time()
 
         async def on_data(_, data: bytearray):
             t, text, ts = decode(bytes(data))
-            if t == 6:   # 狀態改變很重要，每一筆都印出來
+            if t in (6, MSG_DRINK_EVENT):   # 狀態改變、喝水事件很重要，每一筆都印出來
                 print(f"  {time.time() - t_start:5.1f}s  {text}", flush=True)
             counts[t] += 1
             last[t] = text
-            if not first_ts:
+            if not first_ts and t != MSG_DRINK_EVENT:   # 0x07 的時間戳是事件開始時間，不拿來比對時
                 first_ts.append(ts)
-            if t != 5:
+            if t == MSG_DRINK_EVENT:
+                v = struct.unpack_from("<I", data, 1)[0]
+                seq = v >> 21
+                if ARGS.no_ack:
+                    print(f"          （--no-ack：不回 seq {seq} 的 ACK）", flush=True)
+                else:
+                    await c.write_gatt_char(ACK, bytes([MSG_DRINK_EVENT, seq & 0xFF, (seq >> 8) & 0x07]), response=True)
+                    seen = drink_seen.setdefault(seq, 0)
+                    drink_seen[seq] = seen + 1
+                    print(f"          已回 ACK [0x07, 0x{seq & 0xFF:02x}, 0x{(seq >> 8) & 0x07:02x}]"
+                          + ("（重複收到，可能是 ACK 晚到）" if seen else ""), flush=True)
+            elif t != 5:
                 await c.write_gatt_char(ACK, b"\x01", response=True)
 
         await c.start_notify(DATA, on_data)

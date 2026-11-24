@@ -2,7 +2,7 @@
 
 > 給接手的 Claude 對話：開始動手前先完整讀這份文件。這裡記錄了目前狀態，以及已經踩過、不用再查一次的坑。
 
-## 1. 目前進度（2026-11-19）
+## 1. 目前進度（2026-11-24）
 
 - **已完成**：硬體接線測試程式 `main/main.c`，已燒錄實測。I2C、MPR121、IMU、IMU INT 全部通過；電池項目失敗是因為沒接電池（見第 5 節）
 - **已完成**：銅膠帶電極接上，即時顯示新增「水位%」欄（電極0 兩點直線校正）
@@ -10,6 +10,8 @@
 - **已完成**：姿態（俯仰／翻滾／傾斜、直立／傾斜／飲用中／倒下、移動判斷）與「水位只在直立靜止時更新」，在 `main/cup_state.c`
 - **已完成**：休眠（README 第 6 節）。**預設是淺眠、BLE 連線不斷**（使用者不想看到斷線／重新連線）：靜止 30 秒 → IMU wake-on-motion、連線間隔拉長、CPU 自動淺眠（esp_pm），新增 STATE 封包（0x06）讓 App 顯示「水杯休眠中」。深度睡眠保留成選項 `DEEP_SLEEP_ENABLE`（預設 0）。App 端也加了「找不到水杯時每 20 秒背景重試」，深度睡眠模式時用得到
 - **耗電**：C6 沒有 32 kHz 晶振，BLE 淺眠用主晶振，官方數據約 3.3 mA，粗估電池撐 4～5 天（沒實測）。要更省電：開深度睡眠，或硬體加 32 kHz 晶振
+- **已完成（2026-11-24，還沒實機測）**：韌體端偵測喝水／加水（`cup_state.c` 的 `cup_event_*`，規則照 App 的 `lib/state/drink_detector.dart`），新封包 0x07 DRINK_EVENT，事件存 NVS（`main/drink_log.c`）、App 回 3-byte ACK 才刪除、重新訂閱後補傳。韌體版本 **0.3.0**：App 看到 ≥ 0.3.0 要關掉自己的偵測，連線中的事件也只由韌體送。格式見 README 第 5 節「喝水／加水事件」。偵測邏輯有 host 單元測試（`sh test/host/run.sh`）；NVS 儲存、補傳、ACK 只有編譯過，還沒實機驗證
+- **App 端還要做（smart_cup_app）**：`cup_protocol.dart` 解 0x07、回 3-byte ACK `[0x07, seq & 0xFF, (seq >> 8) & 0x07]`（重複收到也要回）、用 seq + 時間戳 + A/B 去重；韌體 ≥ 0.3.0 時關掉 `DrinkDetector`；`time_unknown` 的事件用收到的時間、記成待確認
 - **還沒開始**：RL 參考電極的 TI 比例算法、空杯自動重新校正
 
 ### 休眠實作備忘（2026-11-19 踩過的坑）
@@ -35,7 +37,10 @@
 
 ### BLE 實作備忘
 
-- 協定細節、頻率、姿態門檻都寫在 README 第 5 節。改協定時 App（smart_cup_app）的 `lib/services/cup_protocol.dart` 要同步改
+- 協定細節、頻率、姿態門檻都寫在 README 第 5 節。**改協定時 App（smart_cup_app）的 `lib/services/cup_protocol.dart` 要同步改**（0x07 的 bit 配置、ACK 格式、版本號判斷都在那裡），喝水偵測規則改了的話 `lib/state/drink_detector.dart` 也要對照
+- NVS 在 `app_main` 一開始初始化一次（`nvs_flash_init`），`ble_cup_init` 不再初始化。喝水事件存在 namespace `drinklog`：每筆一個 `u64`（一個 NVS entry，256 筆約 2 頁，預設分割表 nvs 24 KB 放得下）。key = `e` + slot（seq % 256），另外有 `boot_id`、`next_seq`、`tail`
+- 事件偵測和補傳用的時鐘是 `esp_rtc_get_time_us()`（RTC 計時器，深度睡眠也繼續走），不是 `esp_timer`。C6 沒有 32 kHz 晶振，RTC 慢時脈是內部 RC（有校正），長時間會有約 1% 的誤差，只影響「對時前事件換算的時間」和 too_long 的判斷
+- ACK 在 NimBLE host task 收到，用 FreeRTOS queue（`ble_cup_take_event_ack`）交給主迴圈；`drink_log.c` 只在主迴圈呼叫，不用加鎖
 - 開 BLE 之後要重新產生 sdkconfig（`idf.py set-target esp32c6`），因為舊的 sdkconfig 裡 `CONFIG_BT_ENABLED` 是關的，sdkconfig.defaults 不會覆蓋已存在的設定
 - NimBLE 的 API 照 `examples/bluetooth/nimble/bleprph` 寫；送資料用 `ble_gatts_notify_custom()`，om 由 NimBLE 釋放
 - 128-bit UUID 用 `BLE_UUID128_INIT` 時是 little-endian（倒過來寫），characteristic 編號在第 12 個 byte
@@ -57,7 +62,7 @@
 | 目測半杯 | 177.5 | 337.5～345.5 | 521～522 |
 | 滿杯 | 153 | **298** | 519 |
 
-- 校正值在 `main.c` 的 `LEVEL_E0_EMPTY = 403`、`LEVEL_E0_FULL = 298`，公式：`水位% = (403 − 電極0) / (403 − 298) × 100`，超出 0～100 的部分截掉
+- 校正值在 `main/cup_state.c` 的 `LEVEL_E0_EMPTY = 403`、`LEVEL_E0_FULL = 298`，公式：`水位% = (403 − 電極0) / (403 − 298) × 100`，超出 0～100 的部分截掉
 - 目測半杯顯示 55%～62.5%，原因沒有確認（杯子上寬下窄？倒水不準？）。電容電極量的是**高度**不是**容量**；需要更準時，用尺量水深，或加入半杯當第三個校正點，改成兩段直線換算
 - 空杯讀值有漂移：第一次量 218、之後量 205（0.5 µs），杯子移動、手靠近都會影響。正式產品要考慮自動重新校正空杯
 - 換杯子、改電極、改 0x5C/0x5D 之後，都要重新量空杯、滿杯
@@ -89,6 +94,8 @@
   ```bash
   source ~/.espressif/tools/activate_idf_v6.1.sh
   ```
+- **macOS 開發機（2026-11-24 安裝）**：沒有用 EIM（Homebrew 的 eim tap 要 `brew trust`），改用 `git clone -b v6.1 --recursive` 到 `~/.espressif/v6.1/esp-idf` 再 `./install.sh esp32c6`。系統預設的 `python3` 是 3.15，沒有 SSL 憑證、下載工具會失敗，所以安裝時用 Homebrew 的 Python 3.13。`~/.espressif/tools/activate_idf_v6.1.sh` 是手寫的 wrapper（設 `IDF_PYTHON_ENV_PATH` 指到 `idf6.1_py3.13_env` 再 source `export.sh`），用法跟上面一樣；它也支援 `-e`（印出環境變數，仿 EIM 的 activation script，VS Code 擴充套件會呼叫）。cmake、ninja 用 `idf_tools.py install cmake ninja` 裝在 `~/.espressif/tools`（從 Dock 開的 VS Code 沒有 Homebrew 的 PATH）。VS Code 擴充套件靠手寫的 `~/.espressif/tools/eim_idf.json` 找到這份安裝。`~/esp/esp-idf` 是舊的 v5.5，不要用
+- **Linux、macOS 共用同一份 `.vscode/settings.json`**：`idf.currentSetup` 寫成 `${env:HOME}/.espressif/v6.1/esp-idf`（擴充套件讀設定時會展開 `${env:…}`），`idf.port` 設成 `detect`（燒錄時由 esptool 自動找板子）。兩台都要把 ESP-IDF 裝在 `~/.espressif/v6.1/esp-idf`。**不要在 VS Code 用「Select Current ESP-IDF Version」重新選版本**：它會把 `idf.currentSetup` 改回這台機器的絕對路徑，commit 之後另一台就壞了；真的選了就把那行改回來。終端機指令兩台一樣（`source ~/.espressif/tools/activate_idf_v6.1.sh`），只有序列埠名稱不同（Linux `/dev/ttyACM0`、Mac `/dev/cu.usbmodem*`）
 - VS Code ESP-IDF 擴充套件版本 2.3.0。**VS Code 必須開 `/home/user/workspace/smart_cup_test` 這個資料夾。** 如果開的是上一層 `/home/user/workspace`，狀態列的建置、燒錄按鈕會對錯的目錄執行，出現「沒有 CMakeLists.txt」或「找不到 sdkconfig」的錯誤。擴充套件的 log 在 `~/.vscode/extensions/espressif.esp-idf-extension-2.3.0/esp_idf_vsc_ext.log`。
 - `/home/user/workspace/build` 是上一層開錯資料夾時留下的空資料夾，跟本專案無關。
 - 編譯：`idf.py build`。燒錄並開監看：`idf.py -p /dev/ttyACM0 flash monitor`

@@ -34,6 +34,17 @@
 #define WATER_AVG_N             10      // 取最近 10 筆（約 1 秒）平均
 #define WATER_MIN_N             5       // 至少 5 筆才更新
 
+// 喝水／加水事件（和 App 的 drink_detector.dart 一致）
+#ifndef EVT_SETTLE_MS
+#define EVT_SETTLE_MS           3000    // 直立、不在移動持續 3 秒才算「穩定」
+#endif
+#ifndef EVT_MIN_DELTA_PCT
+#define EVT_MIN_DELTA_PCT       3.0f    // 水位變化 ≥ 3%（電極解析度約 2%）才算事件，否則當雜訊
+#endif
+#ifndef EVT_MAX_EPISODE_MS
+#define EVT_MAX_EPISODE_MS      (10u * 60u * 1000u)   // 過程超過 10 分鐘：照樣產生事件，但帶 too_long
+#endif
+
 #define RAD_TO_DEG_F            57.2957795f
 #define ZERO_MAX_TILT_DEG       10.0f
 
@@ -202,6 +213,147 @@ bool cup_water_get(float *pct)
 bool cup_water_holding(void)
 {
     return s_holding;
+}
+
+/* ========================================================================== */
+/*  喝水／加水事件                                                              */
+/* ========================================================================== */
+// 基準與進行中的過程存在 RTC 記憶體：深度睡眠（若打開）醒來後接著算；斷電重開時清空。
+// 時間（now_ms）由呼叫端提供，main.c 用 RTC 計時器（深度睡眠時也繼續走），過程的開始時間醒來後仍有效
+static RTC_DATA_ATTR bool s_have_base;
+static RTC_DATA_ATTR float s_base_pct;          // 基準水位 A
+static RTC_DATA_ATTR bool s_episode;            // 是否有進行中的過程（拿起還沒放回穩定）
+static RTC_DATA_ATTR uint32_t s_episode_start;
+static RTC_DATA_ATTR bool s_saw_drinking;
+static bool s_still;                            // 目前直立且不在移動
+static uint32_t s_still_since;
+
+static void episode_begin(uint32_t now_ms)
+{
+    // 還沒有基準（剛開機）時不開始過程：第一次穩定只建立基準
+    if (s_have_base && !s_episode) {
+        s_episode = true;
+        s_episode_start = now_ms;
+        s_saw_drinking = false;
+    }
+}
+
+// 穩定時拿到水位 B：有過程就結算，否則只追蹤基準
+static bool settle(float level, uint32_t now_ms, cup_event_t *out)
+{
+    float before = s_base_pct;
+    bool had_base = s_have_base;
+    s_base_pct = level;
+    s_have_base = true;
+    if (!had_base || !s_episode) {
+        return false;
+    }
+    bool saw = s_saw_drinking;
+    uint32_t start = s_episode_start;
+    s_episode = false;
+    s_saw_drinking = false;
+
+    // 容許浮點誤差，剛好等於門檻也算
+    const float th = EVT_MIN_DELTA_PCT - 1e-4f;
+    cup_event_kind_t kind;
+    if (before - level >= th) {
+        kind = CUP_EVT_DRINK;
+    } else if (level - before >= th) {
+        kind = CUP_EVT_REFILL;
+    } else {
+        return false;   // 雜訊
+    }
+    out->kind = kind;
+    out->before_pct = before;
+    out->after_pct = level;
+    out->saw_drinking = saw;
+    out->too_long = (uint32_t)(now_ms - start) > EVT_MAX_EPISODE_MS;
+    out->start_ms = start;
+    out->end_ms = now_ms;
+    return true;
+}
+
+bool cup_event_update(cup_pose_t pose, bool moving, bool water_fresh, float water_pct,
+                      uint32_t now_ms, cup_event_t *out)
+{
+    bool still = (pose == CUP_POSE_UPRIGHT) && !moving;
+    if (!still) {
+        // 離開穩定（傾斜／飲用中／倒下／移動／姿態未知）：開始或延續一段過程。
+        // 放下不到 3 秒又拿起，過程還沒結算，算同一段
+        s_still = false;
+        episode_begin(now_ms);
+        if (s_episode && pose == CUP_POSE_DRINKING) {
+            s_saw_drinking = true;
+        }
+        return false;
+    }
+    if (!s_still) {
+        s_still = true;
+        s_still_since = now_ms;
+    }
+    if (!water_fresh || (uint32_t)(now_ms - s_still_since) < EVT_SETTLE_MS) {
+        return false;
+    }
+    return settle(water_pct, now_ms, out);
+}
+
+void cup_event_doze_water(float water_pct)
+{
+    // 休眠中的讀值視為穩定，但不結算事件（進入休眠前已經穩定 30 秒，正常不會有過程）
+    if (!s_episode) {
+        s_base_pct = water_pct;
+        s_have_base = true;
+    }
+}
+
+void cup_event_wake(uint32_t now_ms)
+{
+    s_still = false;
+    episode_begin(now_ms);
+}
+
+bool cup_event_baseline(float *pct)
+{
+    if (!s_have_base) {
+        return false;
+    }
+    *pct = s_base_pct;
+    return true;
+}
+
+bool cup_event_in_episode(void)
+{
+    return s_episode;
+}
+
+void cup_event_reset(void)
+{
+    s_have_base = false;
+    s_base_pct = 0.0f;
+    s_episode = false;
+    s_episode_start = 0;
+    s_saw_drinking = false;
+    s_still = false;
+    s_still_since = 0;
+}
+
+static uint32_t pct_to_half(float pct)
+{
+    long v = lroundf(pct * 2.0f);   // 單位 0.5%
+    if (v < 0) v = 0;
+    if (v > 200) v = 200;
+    return (uint32_t)v;
+}
+
+uint32_t cup_event_encode(const cup_event_t *ev, uint16_t seq, bool time_unknown)
+{
+    return pct_to_half(ev->before_pct)
+         | (pct_to_half(ev->after_pct) << 8)
+         | (((uint32_t)ev->kind & 0x3u) << 16)
+         | ((ev->saw_drinking ? 1u : 0u) << 18)
+         | ((ev->too_long ? 1u : 0u) << 19)
+         | (time_unknown ? CUP_EVT_TIME_UNKNOWN : 0u)
+         | (((uint32_t)seq & CUP_EVT_SEQ_MASK) << 21);
 }
 
 /* ========================================================================== */
