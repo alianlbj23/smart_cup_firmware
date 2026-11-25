@@ -34,7 +34,7 @@
 #define WATER_AVG_N             10      // 取最近 10 筆（約 1 秒）平均
 #define WATER_MIN_N             5       // 至少 5 筆才更新
 
-// 喝水／加水事件（和 App 的 drink_detector.dart 一致）
+// 喝水／加水事件：拿起來喝／加水（和 App 的 drink_detector.dart 一致）
 #ifndef EVT_SETTLE_MS
 #define EVT_SETTLE_MS           3000    // 直立、不在移動持續 3 秒才算「穩定」
 #endif
@@ -43,6 +43,28 @@
 #endif
 #ifndef EVT_MAX_EPISODE_MS
 #define EVT_MAX_EPISODE_MS      (10u * 60u * 1000u)   // 過程超過 10 分鐘：照樣產生事件，但帶 too_long
+#endif
+
+// 直立不動時水位下降也算喝水（韌體 0.4.0：用吸管喝，杯子放在桌上不會被拿起）。
+// 穩定期間水位比基準低 ≥ EVT_STATIC_DELTA_PCT，而且「連續 EVT_STATIC_MIN_SAMPLES 筆」又「持續
+// EVT_STATIC_HOLD_MS」都是，才產生一筆喝水事件；兩個條件都要滿足，中間有一筆回到門檻以內就重新算。
+//   活動中每 100 ms 一筆（每筆是最近 1 秒 10 個讀值的平均）→ 預設實際上是「連續 8 秒」（80 筆）
+//   休眠中每 5 秒一筆（每筆是 200 ms 內 10 個讀值的平均）  → 預設實際上是「連續 3 筆」（跨約 10 秒）
+#ifndef EVT_STATIC_DROP_ENABLE
+#define EVT_STATIC_DROP_ENABLE  1       // 0 = 關掉，回到 0.3.0 的行為：穩定期間水位升降都只更新基準，
+                                        // 拿起放回結算時下降不到門檻，基準也照舊往下改成 B（小口不累積）
+#endif
+#ifndef EVT_STATIC_DELTA_PCT
+#define EVT_STATIC_DELTA_PCT    EVT_MIN_DELTA_PCT   // 直立不動時下降多少（%）才算；預設和拿起來喝同一個門檻（合約 3%）。
+                                                    // 漂移造成誤判時可以單獨調大，不影響拿起來喝的偵測
+#endif
+#ifndef EVT_STATIC_HOLD_MS
+#define EVT_STATIC_HOLD_MS      8000    // 要持續多久（ms）。8 秒：水位是 1 秒的移動平均，單筆雜訊最多影響 1 秒，留 8 倍；
+                                        // 又比休眠中 3 筆的跨度（約 10 秒）短一點，RTC 時鐘有 1% 誤差也不會卡在邊界多等一輪
+#endif
+#ifndef EVT_STATIC_MIN_SAMPLES
+#define EVT_STATIC_MIN_SAMPLES  3       // 至少連續幾筆。主要管休眠（5 秒才一筆）：1 筆是單筆雜訊、2 筆仍可能是巧合，
+                                        // 取 3；也避免量測間隔被拉長時，只靠 2 筆就滿足「持續 8 秒」
 #endif
 
 #define RAD_TO_DEG_F            57.2957795f
@@ -227,6 +249,15 @@ static RTC_DATA_ATTR uint32_t s_episode_start;
 static RTC_DATA_ATTR bool s_saw_drinking;
 static bool s_still;                            // 目前直立且不在移動
 static uint32_t s_still_since;
+// 直立不動時的下降確認。故意不放 RTC 記憶體：深度睡眠醒來後從頭確認（基準有保留、而且沒有往下跟，不會漏算）；
+// 放了反而會讓「睡前 1 筆 + 醒來 1 筆」就滿足持續時間
+static int s_drop_n;                            // 已經連續幾筆「比基準低 ≥ 門檻」（0 = 目前沒有）
+static uint32_t s_drop_since;                   // 這一串第一筆的時間
+
+static void drop_clear(void)
+{
+    s_drop_n = 0;
+}
 
 static void episode_begin(uint32_t now_ms)
 {
@@ -238,13 +269,53 @@ static void episode_begin(uint32_t now_ms)
     }
 }
 
-// 穩定時拿到水位 B：有過程就結算，否則只追蹤基準
+// 穩定、沒有進行中的過程時拿到一筆水位（活動中每 100 ms、休眠中每 5 秒）：直立不動的規則
+static bool track_stable(float level, uint32_t now_ms, cup_event_t *out)
+{
+    // 上升或持平（杯子放著不動時倒水進去、往上的漂移）：基準跟著走，不產生事件
+    if (!EVT_STATIC_DROP_ENABLE || level >= s_base_pct) {
+        s_base_pct = level;
+        drop_clear();
+        return false;
+    }
+    // 比基準低：基準不往下跟（小口喝可以累積；這時拿起杯子，過程會用原本的基準結算）
+    const float th = EVT_STATIC_DELTA_PCT - 1e-4f;   // 容許浮點誤差，剛好等於門檻也算
+    if (s_base_pct - level < th) {
+        drop_clear();          // 還不到門檻（或回到門檻以內）：連續筆數重新算
+        return false;
+    }
+    if (s_drop_n == 0) {
+        s_drop_since = now_ms;
+    }
+    if (s_drop_n < 1000000) {
+        s_drop_n++;
+    }
+    if (s_drop_n < EVT_STATIC_MIN_SAMPLES || (uint32_t)(now_ms - s_drop_since) < EVT_STATIC_HOLD_MS) {
+        return false;          // 還沒持續夠久
+    }
+    out->kind = CUP_EVT_DRINK;
+    out->before_pct = s_base_pct;
+    out->after_pct = level;
+    out->saw_drinking = false;
+    out->too_long = (uint32_t)(now_ms - s_drop_since) > EVT_MAX_EPISODE_MS;
+    out->stationary = true;
+    out->start_ms = s_drop_since;   // 水位開始連續低於「基準 − 門檻」的時間
+    out->end_ms = now_ms;
+    s_base_pct = level;             // 之後（包括拿起來喝）都從 B 算起，不會重複計算
+    drop_clear();
+    return true;
+}
+
+// 穩定時拿到水位 B：還沒有基準 → 建立基準；有過程 → 結算。
+// 結算後基準 = B，只有「下降不到門檻」例外（維持 A）。這樣基準只會經由喝水事件往下走，
+// 所有喝水事件的量加起來 = 基準下降的量，不會多記也不會漏
 static bool settle(float level, uint32_t now_ms, cup_event_t *out)
 {
     float before = s_base_pct;
     bool had_base = s_have_base;
     s_base_pct = level;
     s_have_base = true;
+    drop_clear();
     if (!had_base || !s_episode) {
         return false;
     }
@@ -261,13 +332,21 @@ static bool settle(float level, uint32_t now_ms, cup_event_t *out)
     } else if (level - before >= th) {
         kind = CUP_EVT_REFILL;
     } else {
-        return false;   // 雜訊
+        // 變化不到門檻，不產生事件。上升：基準照舊跟著往上（上面已經改成 B）。
+        // 下降：基準不往下跟，維持 A（和直立不動的規則一致），這一小口留著和之後的下降累積到門檻再記；
+        // 之後不論由哪一條規則記，都是從 A 算起、記完基準才改成 B，所以只會被記一次。
+        // EVT_STATIC_DROP_ENABLE = 0 時照 0.3.0 改成 B（那時穩定期間基準本來就會往下跟，留著也沒有用）
+        if (EVT_STATIC_DROP_ENABLE && level < before) {
+            s_base_pct = before;
+        }
+        return false;
     }
     out->kind = kind;
     out->before_pct = before;
     out->after_pct = level;
     out->saw_drinking = saw;
     out->too_long = (uint32_t)(now_ms - start) > EVT_MAX_EPISODE_MS;
+    out->stationary = false;
     out->start_ms = start;
     out->end_ms = now_ms;
     return true;
@@ -281,6 +360,7 @@ bool cup_event_update(cup_pose_t pose, bool moving, bool water_fresh, float wate
         // 離開穩定（傾斜／飲用中／倒下／移動／姿態未知）：開始或延續一段過程。
         // 放下不到 3 秒又拿起，過程還沒結算，算同一段
         s_still = false;
+        drop_clear();   // 直立不動時還沒確認的下降交給這段過程結算（基準沒有往下跟，不會漏）
         episode_begin(now_ms);
         if (s_episode && pose == CUP_POSE_DRINKING) {
             s_saw_drinking = true;
@@ -294,21 +374,32 @@ bool cup_event_update(cup_pose_t pose, bool moving, bool water_fresh, float wate
     if (!water_fresh || (uint32_t)(now_ms - s_still_since) < EVT_SETTLE_MS) {
         return false;
     }
-    return settle(water_pct, now_ms, out);
+    if (!s_have_base || s_episode) {
+        return settle(water_pct, now_ms, out);
+    }
+    return track_stable(water_pct, now_ms, out);
 }
 
-void cup_event_doze_water(float water_pct)
+bool cup_event_doze_water(float water_pct, uint32_t now_ms, cup_event_t *out)
 {
-    // 休眠中的讀值視為穩定，但不結算事件（進入休眠前已經穩定 30 秒，正常不會有過程）
-    if (!s_episode) {
+    // 休眠中的讀值視為穩定（進入休眠前已經直立靜止 30 秒）。有進行中的過程時不處理：
+    // 正常不會發生，留給喚醒後的 cup_event_update 結算
+    if (s_episode) {
+        return false;
+    }
+    if (!s_have_base) {
         s_base_pct = water_pct;
         s_have_base = true;
+        drop_clear();
+        return false;
     }
+    return track_stable(water_pct, now_ms, out);
 }
 
 void cup_event_wake(uint32_t now_ms)
 {
     s_still = false;
+    drop_clear();   // 休眠中還沒確認的下降交給接下來這段過程結算
     episode_begin(now_ms);
 }
 
@@ -335,6 +426,8 @@ void cup_event_reset(void)
     s_saw_drinking = false;
     s_still = false;
     s_still_since = 0;
+    s_drop_n = 0;
+    s_drop_since = 0;
 }
 
 static uint32_t pct_to_half(float pct)
@@ -354,6 +447,25 @@ uint32_t cup_event_encode(const cup_event_t *ev, uint16_t seq, bool time_unknown
          | ((ev->too_long ? 1u : 0u) << 19)
          | (time_unknown ? CUP_EVT_TIME_UNKNOWN : 0u)
          | (((uint32_t)seq & CUP_EVT_SEQ_MASK) << 21);
+}
+
+/* ========================================================================== */
+/*  Device Status                                                               */
+/* ========================================================================== */
+size_t cup_status_encode(uint8_t battery, uint8_t major, uint8_t minor, uint8_t patch,
+                         const uint8_t *addr_le, uint8_t out[CUP_STATUS_LEN])
+{
+    out[0] = battery;
+    out[1] = major;
+    out[2] = minor;
+    out[3] = patch;
+    if (addr_le == NULL) {
+        return CUP_STATUS_LEN_NO_ADDR;
+    }
+    for (int i = 0; i < 6; i++) {
+        out[4 + i] = addr_le[5 - i];   // 最低位元組在前 → 顯示順序（最高位元組在前）
+    }
+    return CUP_STATUS_LEN;
 }
 
 /* ========================================================================== */

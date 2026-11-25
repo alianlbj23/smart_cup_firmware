@@ -1209,22 +1209,31 @@ static uint32_t uptime_ms(void)
 }
 
 // 休眠中量水位：連讀 10 筆（每筆隔 20 ms）餵給 cup_state 平均。杯子不是直立時不更新水位。
-// 直立時休眠中的讀值視為「穩定」：只更新喝水偵測的基準，不產生事件（例如杯子放著不動時有人倒水進去）
+// 直立時休眠中的讀值視為「穩定」，套用直立不動的規則（cup_state.c）：水位上升只更新基準
+// （杯子放著不動時有人倒水進去）；下降 ≥ 門檻而且連續好幾筆 → 喝水事件（用吸管喝），存 flash、有連線就送
 static void doze_measure_water(bool upright)
 {
     if (!s_mpr_ready) {
         return;
     }
+    int got = 0;   // 這一輪成功讀到幾筆
     for (int i = 0; i < 10; i++) {
         uint16_t e0, e1;
         if (mpr121_read_filtered(&e0, &e1)) {
             cup_water_add_sample(e0, upright);
+            got++;
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     float pct;
-    if (upright && cup_water_get(&pct) && !cup_water_holding()) {
-        cup_event_doze_water(pct);
+    // 10 筆都讀到才算一筆新的量測：讀取失敗時 cup_water_get 拿到的是之前的舊值，
+    // 不能讓同一個舊值被當成「連續好幾筆都偏低」
+    if (got == 10 && upright && cup_water_get(&pct) && !cup_water_holding()) {
+        cup_event_t ev;
+        // 時鐘要和 live_loop 的 cup_event_update 一樣（RTC 計時器），事件的開始時間才對得上
+        if (cup_event_doze_water(pct, drink_log_clock_ms(), &ev)) {
+            drink_log_add(&ev);   // 先存 flash，有連線就立刻送 0x07
+        }
     }
 }
 
@@ -1417,7 +1426,8 @@ static void live_loop(void)
         // ---- 喝水／加水事件（沒有 IMU 時看不出拿起放下，不偵測）----
         if (have_motion) {
             float wpct = 0.0f;
-            bool fresh = cup_water_get(&wpct) && !cup_water_holding();
+            // have_e：這一輪電極有讀到。讀取失敗時水位是舊值，不拿去偵測（直立不動的規則要「連續好幾筆」都是新量到的）
+            bool fresh = have_e && cup_water_get(&wpct) && !cup_water_holding();
             cup_event_t ev;
             if (cup_event_update(motion.pose, motion.moving, fresh, wpct, drink_log_clock_ms(), &ev)) {
                 drink_log_add(&ev);   // 先存 flash，有連線就立刻送 0x07

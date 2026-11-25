@@ -7,7 +7,12 @@
  *   Data Notify  3c8b0003-…  杯→App  Notify  type(1) + value(uint32 LE) + timestamp(uint32 LE) = 9 bytes
  *   ACK          3c8b0004-…  App→杯  Write   1 byte [0x01] = 收到（只計數）；
  *                                              3 bytes [0x07, seq 低 8 bits, seq 高 3 bits] = 確認某一筆 DRINK_EVENT
- *   Device Status 3c8b0005-… 杯→App  Read/Notify  [電量 %（0xFF=未知）, 韌體 major, minor, patch]
+ *   Device Status 3c8b0005-… 杯→App  Read/Notify  10 bytes（韌體 0.4.0 起；之前是前 4 bytes）：
+ *                                              [電量 %（0xFF=未知）, 韌體 major, minor, patch,
+ *                                               BLE 位址 6 bytes，顯示順序（最高位元組在前）]
+ *                                              例：位址 58:E6:C5:12:E0:CE → 58 E6 C5 12 E0 CE。
+ *                                              App 用這 6 bytes 當 cup_hardware_id（iOS 拿不到 BLE 位址）。
+ *                                              內容由 cup_state.c 的 cup_status_encode 組出來
  *
  * Data Notify 的 type：
  *   0x02 WATER    bits 24..0 = 水量 25-bit 分數（0～2^25-1），bits 28..25 = 刻度 0～10
@@ -16,7 +21,8 @@
  *   0x05 ATTITUDE bits 15..0 = pitch int16 0.1°，bits 31..16 = roll int16 0.1°（App 不回 ACK）
  *   0x06 STATE    bits 7..0 = 狀態（0 活動中、1 休眠中），bits 31..8 = 進入目前狀態幾秒
  *                 狀態改變時、App 訂閱後 1.5 秒送；休眠中每 10 秒送一次
- *   0x07 DRINK_EVENT（韌體 0.3.0 起）喝水／加水事件，偵測在 cup_state.c、存 flash 與補傳在 drink_log.c
+ *   0x07 DRINK_EVENT（韌體 0.3.0 起）喝水／加水事件，偵測在 cup_state.c、存 flash 與補傳在 drink_log.c。
+ *                 韌體 0.4.0 起，直立不動時水位下降（用吸管喝）也會產生喝水事件：種類 0、saw_drinking = 0，格式不變
  *                 bits 7..0   = 拿起前水位 A，單位 0.5%（0～200）
  *                 bits 15..8  = 放回後水位 B，單位 0.5%（0～200）
  *                 bits 17..16 = 種類（0 喝水、1 加水，其他保留）
@@ -39,7 +45,7 @@
 #include "esp_err.h"
 
 #define CUP_FW_MAJOR 0
-#define CUP_FW_MINOR 3
+#define CUP_FW_MINOR 4
 #define CUP_FW_PATCH 0
 
 // App 訂閱 Data Notify 後等多久才補送目前狀態與未確認的事件（太早送，App 可能還沒準備好接收而漏掉）

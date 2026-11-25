@@ -2,7 +2,7 @@
 
 > 給接手的 Claude 對話：開始動手前先完整讀這份文件。這裡記錄了目前狀態，以及已經踩過、不用再查一次的坑。
 
-## 1. 目前進度（2026-11-24）
+## 1. 目前進度（2026-11-25）
 
 - **已完成**：硬體接線測試程式 `main/main.c`，已燒錄實測。I2C、MPR121、IMU、IMU INT 全部通過；電池項目失敗是因為沒接電池（見第 5 節）
 - **已完成**：銅膠帶電極接上，即時顯示新增「水位%」欄（電極0 兩點直線校正）
@@ -11,7 +11,27 @@
 - **已完成**：休眠（README 第 6 節）。**預設是淺眠、BLE 連線不斷**（使用者不想看到斷線／重新連線）：靜止 30 秒 → IMU wake-on-motion、連線間隔拉長、CPU 自動淺眠（esp_pm），新增 STATE 封包（0x06）讓 App 顯示「水杯休眠中」。深度睡眠保留成選項 `DEEP_SLEEP_ENABLE`（預設 0）。App 端也加了「找不到水杯時每 20 秒背景重試」，深度睡眠模式時用得到
 - **耗電**：C6 沒有 32 kHz 晶振，BLE 淺眠用主晶振，官方數據約 3.3 mA，粗估電池撐 4～5 天（沒實測）。要更省電：開深度睡眠，或硬體加 32 kHz 晶振
 - **已完成（2026-11-24，還沒實機測）**：韌體端偵測喝水／加水（`cup_state.c` 的 `cup_event_*`，規則照 App 的 `lib/state/drink_detector.dart`），新封包 0x07 DRINK_EVENT，事件存 NVS（`main/drink_log.c`）、App 回 3-byte ACK 才刪除、重新訂閱後補傳。韌體版本 **0.3.0**：App 看到 ≥ 0.3.0 要關掉自己的偵測，連線中的事件也只由韌體送。格式見 README 第 5 節「喝水／加水事件」。偵測邏輯有 host 單元測試（`sh test/host/run.sh`）；NVS 儲存、補傳、ACK 只有編譯過，還沒實機驗證
-- **App 端還要做（smart_cup_app）**：`cup_protocol.dart` 解 0x07、回 3-byte ACK `[0x07, seq & 0xFF, (seq >> 8) & 0x07]`（重複收到也要回）、用 seq + 時間戳 + A/B 去重；韌體 ≥ 0.3.0 時關掉 `DrinkDetector`；`time_unknown` 的事件用收到的時間、記成待確認
+- **已寫完（2026-11-25，韌體 0.4.0）——沒有編譯過、沒有燒錄、沒有實機測**。寫的那台機器沒有 ESP-IDF，也沒有接水杯。介面依據是 `food_intake-viz/docs/smart-cup/CONTRACT.md` §1（韌體 ↔ App ↔ Server 的合約，改介面要先改那份）：
+  1. **直立不動時水位下降也算喝水**（住民用吸管喝，杯子不會被拿起）：`cup_state.c` 的 `track_stable()`。穩定期間水位比基準低 ≥ 3%，而且連續 ≥ 3 筆、持續 ≥ 8 秒 → 喝水事件（`saw_drinking = 0`，A = 原基準、B = 當下水位）；上升只更新基準；還不到門檻時基準不往下跟（小口可以累積）。**拿起放回結算時下降不到 3%，基準也不往下跟、維持 A**（使用者 2026-11-25 決定；上升不到 3% 照舊往上跟），所以基準只會經由喝水事件往下走。休眠中每 5 秒量到的水位走同一條規則：`cup_event_doze_water()` 的簽名改成 `bool cup_event_doze_water(float pct, uint32_t now_ms, cup_event_t *out)`，`main.c` 的 `doze_measure_water()` 拿到事件就 `drink_log_add()`。新參數 `EVT_STATIC_DROP_ENABLE`／`EVT_STATIC_DELTA_PCT`／`EVT_STATIC_HOLD_MS`／`EVT_STATIC_MIN_SAMPLES`，規則、已知風險、怎麼調寫在 README 第 5 節
+  2. **Device Status 加 BLE 位址**：4 bytes → 10 bytes `[電量, major, minor, patch, 位址 6 bytes（最高位元組在前）]`，Read 和 Notify 都是。內容由 `cup_state.c` 的 `cup_status_encode()` 組（純計算，有單元測試），`ble_gatt_svr.c` 在 `on_sync` 把 `ble_hs_id_copy_addr` 的位址存起來。位址取不到時只回 4 bytes
+  3. `tools/ble_check.py` 印出位址並和掃描到的位址比對
+  - **驗證到哪裡**：`cup_state.c`（偵測邏輯、Device Status 內容）有 host 單元測試，`sh test/host/run.sh` 全部通過（預設參數 199 項檢查；`EVT_STATIC_DROP_ENABLE=0` 再跑一次 73 項）。`main.c`、`ble_gatt_svr.c`、`drink_log.c` 的改動**只用 host 的 gcc 加上手寫的假標頭做過語法檢查**（假標頭是憑記憶寫的，不等於真的 IDF），所以**要在有 IDF 的機器上 `idf.py build`，再實機測**
+  - **實機要測**：(a) `tools/ble_check.py` 的 Device Status 是 10 bytes、位址和掃描到的一致、韌體 0.4.0；(b) 杯子放桌上用吸管喝，序列埠出現 `[事件] 喝水 …，杯子直立不動` 而且量合理；(c) 靜置 30 分鐘以上（活動中＋休眠中）、手在杯子旁邊靠近再離開、空杯靜置，都**不應該**出現事件，出現的話照 README 調 `EVT_STATIC_DELTA_PCT` 或關掉；(d) 休眠中用吸管喝、有連線時 App 收得到；(e) 原本拿起來喝／加水的事件照常、沒有重複；(f) 沒喝水、反覆拿起放回不同位置 20 次以上，**不應該**出現事件；每次只喝一小口（不到 3%），幾次之後要出現一筆合計的事件
+- **直立不動規則的備忘**：
+  - 基準在穩定期間等於「看過的最高值」（只往上跟）。所以往下的漂移、手靠近再離開，都可能被算成喝水——這是規則本身的限制，加長持續時間擋不掉，只能調門檻或關掉
+  - 還沒確認的下降（`s_drop_n`、`s_drop_since`）**故意不放 RTC 記憶體**：深度睡眠醒來後重新確認。放了的話「睡前 1 筆 + 醒來 1 筆」就會滿足持續時間。基準本身在 RTC 記憶體而且沒有往下跟，不會漏
+  - 事件的開始時間是「連續低於 基準 − 門檻 的第一筆」，不是「第一次略低於基準」（後者會被雜訊拉到好幾個小時前）
+  - 電極讀取失敗時水位是舊值，`live_loop`（`have_e`）和 `doze_measure_water`（10 筆都要讀到）都不把舊值拿去偵測，否則同一個舊值會被當成「連續好幾筆偏低」
+  - `drink_log_add()` 現在休眠中也會被呼叫，送出時的 ACK 逾時跟著上一次 `drink_log_poll()` 的 `dozing`（`s_dozing`）
+  - 「拿起 → 放回」結算下降不到 3% 時基準維持 A（`settle()` 最後的 else）。**這一點和 App 的 `drink_detector.dart` 不一致**（App 是改成 B；韌體 ≥ 0.3.0 時 App 的偵測本來就關閉）。既有測試「雜訊（變化 < 3%）」的預期跟著改了：預設參數下基準留在 50、下一口記 50 → 45；`EVT_STATIC_DROP_ENABLE=0` 時仍是 0.3.0 的 48、48 → 45
+  - `EVT_STATIC_DROP_ENABLE=0` 同時關掉「直立不動算喝水」和「結算時基準不往下跟」：穩定期間基準會往下跟的話，結算時留著 A 也沒有用
+  - 副作用：每次放回位置不同造成的讀值差（往下、不到 3%）不再被吸收，會累積；實機要看反覆拿起放下、沒喝水時會不會冒出事件
+  - host 測試要有 `cc`。沒有的機器可以用有 gcc 的 Docker image 跑，例如 `docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src node:22-bookworm sh test/host/run.sh`
+- **App 端還要做（smart_cup_app）**：
+  - 0.3.0 的部分：`cup_protocol.dart` 解 0x07、回 3-byte ACK `[0x07, seq & 0xFF, (seq >> 8) & 0x07]`（重複收到也要回）、用 seq + 時間戳 + A/B 去重；韌體 ≥ 0.3.0 時關掉 `DrinkDetector`
+  - 0.4.0（合約 §1.1）：讀 Device Status，長度 ≥ 10 時把 byte 4..9 組成大寫、冒號分隔的字串（例如 `58:E6:C5:12:E0:CE`）當 `cup_hardware_id`；長度 < 10（舊韌體，或位址取不到）用平台給的 remoteId。Notify 也是 10 bytes，解析不能寫死長度 4
+  - 0.4.0（合約 §1.2）：種類 0（喝水）的事件一律計入喝水量、`status = ok`，**不論 `saw_drinking`、`too_long`**（之前「沒有 `saw_drinking` 標成待確認」的做法要拿掉）；`time_unknown` 的事件用收到的時間、另外記 `time_estimated = true`，一樣計入；種類 1（加水）照樣記錄，不計入喝水量
+  - 一口氣用吸管喝很久會收到好幾筆前後相接的喝水事件（上一筆的 B = 下一筆的 A），都要計入，不要當成重複
 - **還沒開始**：RL 參考電極的 TI 比例算法、空杯自動重新校正
 
 ### 休眠實作備忘（2026-11-19 踩過的坑）
@@ -37,7 +57,8 @@
 
 ### BLE 實作備忘
 
-- 協定細節、頻率、姿態門檻都寫在 README 第 5 節。**改協定時 App（smart_cup_app）的 `lib/services/cup_protocol.dart` 要同步改**（0x07 的 bit 配置、ACK 格式、版本號判斷都在那裡），喝水偵測規則改了的話 `lib/state/drink_detector.dart` 也要對照
+- 協定細節、頻率、姿態門檻都寫在 README 第 5 節。**改協定時 App（smart_cup_app）的 `lib/services/cup_protocol.dart` 要同步改**（0x07 的 bit 配置、ACK 格式、版本號判斷、Device Status 的長度都在那裡），喝水偵測規則改了的話 `lib/state/drink_detector.dart` 也要對照（0.4.0 的「直立不動」規則只有韌體有）
+- `ble_hs_id_copy_addr` 給的位址是**最低位元組在前**；Device Status、序列埠、廣播名稱用的都是反過來的顯示順序
 - NVS 在 `app_main` 一開始初始化一次（`nvs_flash_init`），`ble_cup_init` 不再初始化。喝水事件存在 namespace `drinklog`：每筆一個 `u64`（一個 NVS entry，256 筆約 2 頁，預設分割表 nvs 24 KB 放得下）。key = `e` + slot（seq % 256），另外有 `boot_id`、`next_seq`、`tail`
 - 事件偵測和補傳用的時鐘是 `esp_rtc_get_time_us()`（RTC 計時器，深度睡眠也繼續走），不是 `esp_timer`。C6 沒有 32 kHz 晶振，RTC 慢時脈是內部 RC（有校正），長時間會有約 1% 的誤差，只影響「對時前事件換算的時間」和 too_long 的判斷
 - ACK 在 NimBLE host task 收到，用 FreeRTOS queue（`ble_cup_take_event_ack`）交給主迴圈；`drink_log.c` 只在主迴圈呼叫，不用加鎖

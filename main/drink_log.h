@@ -23,7 +23,8 @@ void drink_log_init(bool woke_from_deep_sleep);
 // 事件偵測用的時鐘（ms）：RTC 計時器，從上電起算，深度睡眠時也繼續走（uint32 約 49 天繞一圈，只拿來算差值）
 uint32_t drink_log_clock_ms(void);
 
-// 新事件：寫進 NVS，有連線且已訂閱就立刻送出
+// 新事件：寫進 NVS，有連線且已訂閱就立刻送出。活動中、休眠中都可以呼叫
+// （0.4.0 起休眠中直立不動時水位下降也會產生喝水事件）
 void drink_log_add(const cup_event_t *ev);
 
 // 主迴圈每一輪呼叫（活動中 100 ms、休眠中 250 ms）：處理 ACK、對時換算、補傳與重送。

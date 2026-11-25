@@ -5,13 +5,16 @@
  *         直立／傾斜／飲用中／倒下（代碼與 App 的 CupPose 一致）
  *   水位：只在「直立且靜止」時更新；傾斜或移動時保持最後一次有效的水位
  *   零點與最後的水位存在 RTC 記憶體，深度睡眠喚醒後沿用
- *   事件：由姿態與水位偵測喝水／加水（規則和 App 的 lib/state/drink_detector.dart 一致），
+ *   事件：由姿態與水位偵測喝水／加水（拿起來喝的規則和 App 的 lib/state/drink_detector.dart 一致；
+ *         0.4.0 起另外有「直立不動時水位下降也算喝水」，給用吸管喝的情況），
  *         產生 BLE 0x07 DRINK_EVENT 的 value；儲存與補傳在 drink_log.c
+ *   Device Status：BLE 3c8b0005 的內容（電量、版本、BLE 位址）
  *   電量：電池電壓 → 百分比
  */
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // 姿態代碼：BLE POSE 封包 bits 23..16，必須和 App 的 CupPose 列舉順序一致
@@ -61,10 +64,23 @@ bool cup_water_holding(void);
 /* ========================================================================== */
 /*  喝水／加水事件                                                              */
 /* ========================================================================== */
-// 「穩定」= 直立、不在移動，持續 ≥ EVT_SETTLE_MS，而且有新鮮的水位讀值。穩定時的水位是基準 A，
-// 穩定期間基準跟著水位走（慢慢漂移、杯子放著不動時倒水進去，都只更新基準）。
-// 離開穩定 → 開始一段「過程」；再次穩定得到水位 B：A − B ≥ 門檻 → 喝水，B − A ≥ 門檻 → 加水。
-// 不論有沒有事件，基準都改成 B。還沒有基準時，第一次穩定只建立基準。
+// 「穩定」= 直立、不在移動，持續 ≥ EVT_SETTLE_MS，而且有新鮮的水位讀值。穩定時的水位是基準 A。
+//
+// 拿起來喝／加水：離開穩定 → 開始一段「過程」；再次穩定得到水位 B：A − B ≥ 門檻 → 喝水，
+//   B − A ≥ 門檻 → 加水，基準改成 B。變化不到門檻時不產生事件：上升 → 基準改成 B；
+//   下降 → 基準不往下跟，維持 A（0.4.0 起；小口可以跨過好幾次拿起放回累積到門檻再記。
+//   App 的 drink_detector.dart 這裡是改成 B，兩邊不再一致）。還沒有基準時，第一次穩定只建立基準。
+//
+// 直立不動（韌體 0.4.0 起，用吸管喝、杯子不會被拿起）：穩定期間每一筆水位和基準比
+//   上升或持平            → 基準跟著走，不產生事件（杯子放著不動時倒水進去）
+//   比基準低、還不到門檻  → 基準不往下跟（小口喝可以累積到門檻；這時拿起杯子，過程用原本的基準結算，不會漏）
+//   比基準低 ≥ 門檻，而且連續 EVT_STATIC_MIN_SAMPLES 筆、持續 EVT_STATIC_HOLD_MS 都是
+//                         → 喝水事件（saw_drinking = false、stationary = true），A = 原基準、B = 這一筆水位，
+//                           基準改成 B。中間只要有一筆回到門檻以內就重新算，單筆雜訊不會觸發
+//   休眠中每 5 秒量到的水位（cup_event_doze_water）套用同一條規則。
+//   兩條路徑共用同一個基準，而且基準只會經由喝水事件往下走：直立不動產生事件後基準已經是 B，
+//   之後拿起來只會從 B 算起，不會重複計算；所有喝水事件的量加起來 = 基準下降的量。
+//
 // 「待確認」由 App 決定，這裡只給原始旗標（saw_drinking、too_long）。
 typedef enum {
     CUP_EVT_DRINK  = 0,   // 水位下降
@@ -73,12 +89,14 @@ typedef enum {
 
 typedef struct {
     cup_event_kind_t kind;
-    float before_pct;     // 拿起前的水位 A（%）
-    float after_pct;      // 放回穩定後的水位 B（%）
-    bool saw_drinking;    // 過程中出現過「飲用中」姿態
+    float before_pct;     // 拿起前的水位 A（%）；直立不動的事件 = 原本的基準
+    float after_pct;      // 放回穩定後的水位 B（%）；直立不動的事件 = 確認當下的水位
+    bool saw_drinking;    // 過程中出現過「飲用中」姿態（直立不動的事件一定是 false）
     bool too_long;        // 過程超過 EVT_MAX_EPISODE_MS
-    uint32_t start_ms;    // 過程開始（離開穩定）的時間，和呼叫端傳入的 now_ms 同一個時鐘
-    uint32_t end_ms;      // 重新穩定的時間
+    bool stationary;      // 這筆是「直立不動時水位下降」產生的（只給序列埠顯示用，不會送給 App）
+    uint32_t start_ms;    // 過程開始（離開穩定）的時間，和呼叫端傳入的 now_ms 同一個時鐘。
+                          // 直立不動的事件 = 水位開始「連續低於基準 ≥ 門檻」的那一筆的時間
+    uint32_t end_ms;      // 重新穩定的時間；直立不動的事件 = 確認（產生事件）的時間
 } cup_event_t;
 
 // 每次姿態更新後呼叫一次（活動中每 100 ms）。
@@ -87,8 +105,10 @@ typedef struct {
 bool cup_event_update(cup_pose_t pose, bool moving, bool water_fresh, float water_pct,
                       uint32_t now_ms, cup_event_t *out);
 
-// 休眠中量到水位時呼叫（只有進入休眠時是直立靜止才呼叫）：視為穩定，只更新基準，不產生事件
-void cup_event_doze_water(float water_pct);
+// 休眠中量到水位時呼叫（只有進入休眠時是直立靜止才呼叫）：視為穩定，套用「直立不動」的規則
+// （上升只更新基準；下降 ≥ 門檻而且持續夠久 → 喝水事件）。now_ms 要和 cup_event_update 用同一個時鐘。
+// 產生事件時回傳 true 並填 *out（呼叫端要 drink_log_add）。有進行中的過程時不處理，回傳 false。
+bool cup_event_doze_water(float water_pct, uint32_t now_ms, cup_event_t *out);
 
 // 從休眠喚醒時呼叫：視為離開穩定（有基準時開始一段過程）
 void cup_event_wake(uint32_t now_ms);
@@ -106,6 +126,20 @@ void cup_event_reset(void);
 #define CUP_EVT_SEQ_MASK        0x7FFu
 #define CUP_EVT_TIME_UNKNOWN    (1u << 20)
 uint32_t cup_event_encode(const cup_event_t *ev, uint16_t seq, bool time_unknown);
+
+/* ========================================================================== */
+/*  Device Status（BLE 3c8b0005）                                               */
+/* ========================================================================== */
+// 韌體 0.4.0 起 10 bytes：[電量 %（0xFF = 未知）, 韌體 major, minor, patch, BLE 位址 6 bytes]。
+// 位址是「顯示順序」（最高位元組在前）：58:E6:C5:12:E0:CE → 58 E6 C5 12 E0 CE。
+//   addr_le：NimBLE ble_hs_id_copy_addr 給的位址（最低位元組在前），這裡會反過來；
+//            NULL = 位址還沒準備好（BLE 還沒 sync）→ 只填前 4 bytes。
+// 回傳寫進 out 的長度：有位址 CUP_STATUS_LEN，沒有位址 CUP_STATUS_LEN_NO_ADDR
+// （App 看到長度 < 10 會改用手機平台給的 remoteId，不會拿到一個全 0 的假位址）。
+#define CUP_STATUS_LEN          10
+#define CUP_STATUS_LEN_NO_ADDR  4
+size_t cup_status_encode(uint8_t battery, uint8_t major, uint8_t minor, uint8_t patch,
+                         const uint8_t *addr_le, uint8_t out[CUP_STATUS_LEN]);
 
 // 電池電壓（mV）→ 電量 %；電壓太低（沒接電池）回傳 0xFF 代表未知
 uint8_t cup_battery_percent(int bat_mv);

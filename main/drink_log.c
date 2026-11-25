@@ -72,6 +72,7 @@ static bool s_paused;                 // 這次連線重送太多次沒 ACK，�
 static int s_inflight = -1;           // 在途（送出等 ACK）的 slot，-1 = 沒有
 static uint32_t s_sent_at;
 static int s_tries;                   // 在途這筆送了幾次
+static bool s_dozing;                 // 上一次 drink_log_poll 是不是在休眠中（drink_log_add 送出時用同樣的 ACK 逾時）
 
 /* ========================================================================== */
 /*  小工具                                                                      */
@@ -285,15 +286,16 @@ void drink_log_add(const cup_event_t *ev)
     nvs_put_u16("next_seq", s_next_seq);
     nvs_flush();
 
-    printf("[事件] %s %.1f%% → %.1f%%（seq %u%s%s%s，%" PRIu32 " 秒前開始）已存進 flash，未確認 %" PRIu32 " 筆\n",
+    printf("[事件] %s %.1f%% → %.1f%%（seq %u%s%s%s%s，%" PRIu32 " 秒前開始）已存進 flash，未確認 %" PRIu32 " 筆\n",
            ev->kind == CUP_EVT_DRINK ? "喝水" : "加水", ev->before_pct, ev->after_pct, (unsigned)seq,
            ev->saw_drinking ? "，有飲用姿態" : "，沒有飲用姿態",
+           ev->stationary ? "，杯子直立不動" : "",
            ev->too_long ? "，過程太久" : "",
            unknown ? "，還沒對時" : "", ago_s, s_live_n);
 
     // 新事件給這次連線一次新機會（之前可能因為重送太多次暫停了）
     s_paused = false;
-    pump(now_ms, false);
+    pump(now_ms, s_dozing);
 }
 
 /* ========================================================================== */
@@ -432,6 +434,7 @@ static void pump(uint32_t now_ms, bool dozing)
 
 void drink_log_poll(bool dozing)
 {
+    s_dozing = dozing;
     handle_acks();
     handle_time_sync();
     pump(drink_log_clock_ms(), dozing);

@@ -18,6 +18,8 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
+#include "cup_state.h"   // cup_status_encode：Device Status 的內容
+
 /* ========================================================================== */
 /*  UUID                                                                        */
 /* ========================================================================== */
@@ -53,6 +55,10 @@ static volatile bool s_data_sub, s_status_sub;
 static volatile bool s_started;
 static uint8_t s_own_addr_type;
 static char s_name[20];
+// BLE 位址（NimBLE 的順序：最低位元組在前）。on_sync 取得後才設 s_addr_valid；
+// 在那之前不會廣播、也不會有連線，Device Status 理論上讀不到，真的讀到就只回前 4 bytes
+static uint8_t s_addr_le[6];
+static volatile bool s_addr_valid;
 static volatile uint8_t s_battery = 0xFF;
 static volatile uint32_t s_notify_count, s_ack_count;
 static volatile uint32_t s_subscribe_count;
@@ -84,6 +90,13 @@ static void request_conn_params(uint16_t conn)
 
 static void advertise(void);
 
+// Device Status 的內容：[電量, major, minor, patch, 位址 6 bytes（最高位元組在前）]，回傳長度（10；沒有位址時 4）
+static size_t status_fill(uint8_t battery, uint8_t st[CUP_STATUS_LEN])
+{
+    return cup_status_encode(battery, CUP_FW_MAJOR, CUP_FW_MINOR, CUP_FW_PATCH,
+                             s_addr_valid ? s_addr_le : NULL, st);
+}
+
 static void put_u32(uint8_t *p, uint32_t v)
 {
     p[0] = v & 0xFF;
@@ -102,8 +115,9 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         if (which == CHR_STATUS) {
-            uint8_t st[4] = { s_battery, CUP_FW_MAJOR, CUP_FW_MINOR, CUP_FW_PATCH };
-            return os_mbuf_append(ctxt->om, st, sizeof(st)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            uint8_t st[CUP_STATUS_LEN];
+            size_t st_len = status_fill(s_battery, st);
+            return os_mbuf_append(ctxt->om, st, (uint16_t)st_len) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
         }
         return BLE_ATT_ERR_READ_NOT_PERMITTED;
     }
@@ -303,7 +317,13 @@ static void on_sync(void)
         return;
     }
     uint8_t addr[6] = { 0 };
-    ble_hs_id_copy_addr(s_own_addr_type, addr, NULL);   // addr[0] 是最低位元組
+    int rc = ble_hs_id_copy_addr(s_own_addr_type, addr, NULL);   // addr[0] 是最低位元組
+    if (rc == 0) {
+        memcpy(s_addr_le, addr, sizeof(s_addr_le));
+        s_addr_valid = true;   // Device Status 從這裡開始帶位址（10 bytes）
+    } else {
+        printf("[BLE] 讀不到 BLE 位址 rc=%d，Device Status 不帶位址（只有 4 bytes）\n", rc);
+    }
     snprintf(s_name, sizeof(s_name), "SmartCup-%02X%02X", addr[1], addr[0]);
     ble_svc_gap_device_name_set(s_name);
     s_started = true;
@@ -432,8 +452,9 @@ void ble_cup_set_battery(uint8_t pct)
     if (conn == BLE_HS_CONN_HANDLE_NONE || !s_status_sub) {
         return;
     }
-    uint8_t st[4] = { pct, CUP_FW_MAJOR, CUP_FW_MINOR, CUP_FW_PATCH };
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(st, sizeof(st));
+    uint8_t st[CUP_STATUS_LEN];
+    size_t st_len = status_fill(pct, st);
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(st, (uint16_t)st_len);
     if (om != NULL) {
         ble_gatts_notify_custom(conn, s_status_handle, om);
     }

@@ -1,5 +1,8 @@
 """模擬 App 的 BLE 流程：掃描 → 連線 → 對時 → 讀電量 → 訂閱 → 收封包並 ACK（ATTITUDE 不 ACK）→ 統計。
 
+Device Status（韌體 0.4.0 起 10 bytes）會印出杯子自己回報的 BLE 位址，並和掃描到的位址比對
+（Linux／Windows 掃描到的就是 BLE 位址；macOS 給的是 UUID，沒辦法比）。
+
 DRINK_EVENT（0x07）每一筆都印出來，並回 3-byte ACK [0x07, seq 低 8 bits, seq 高 3 bits]，韌體收到才從 flash 刪除。
 
   python tools/ble_check.py 10            # 收 10 秒
@@ -26,6 +29,23 @@ SECONDS = ARGS.seconds
 
 def fmt_time(ts: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def fmt_status(st: bytes, scan_addr: str = "") -> str:
+    """Device Status：[電量, major, minor, patch]，長度 ≥ 10 時後面 6 bytes 是 BLE 位址（顯示順序，最高位元組在前）。"""
+    if len(st) < 4:
+        return f"Device Status: {list(st)}（長度 {len(st)}，少於 4 bytes，格式不對）"
+    bat = "未知" if st[0] == 0xFF else f"{st[0]}%"
+    text = f"Device Status: {list(st)}（電量 {bat}，韌體 {st[1]}.{st[2]}.{st[3]}"
+    if len(st) >= 10:
+        addr = ":".join(f"{b:02X}" for b in st[4:10])
+        text += f"，位址 {addr}"
+        scan = scan_addr.upper()
+        if len(scan) == 17 and scan.count(":") == 5:   # 掃描到的是 BLE 位址（不是 macOS 的 UUID）才比對
+            text += "，和掃描到的位址一致" if scan == addr else f"，和掃描到的位址 {scan} 不一致！"
+    else:
+        text += "，沒有位址：韌體 0.4.0 以前，或位址還沒準備好"
+    return text + "）"
 
 
 def decode_drink_event(v: int, ts: int) -> str:
@@ -78,7 +98,7 @@ async def main():
         now = int(time.time())
         await c.write_gatt_char(TIME, struct.pack("<I", now), response=True)
         st = await c.read_gatt_char(STATUS)
-        print(f"Device Status: {list(st)}（電量 {'未知' if st[0] == 0xFF else str(st[0]) + '%'}，韌體 {st[1]}.{st[2]}.{st[3]}）")
+        print(fmt_status(bytes(st), dev.address))
         counts = Counter()
         last = {}
         first_ts = []
