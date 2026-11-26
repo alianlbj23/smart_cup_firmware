@@ -68,7 +68,8 @@ jobs:
           cp build/smart_cup_test.elf             dist/smart_cup_test.elf
           # flash_args 裡的路徑改成和 dist 同一層，解壓後在資料夾裡直接 esptool write-flash @flash_args
           sed -e 's#bootloader/##; s#partition_table/##' build/flash_args > dist/flash_args
-          cat > dist/燒錄說明.txt <<EOF
+          # 檔名用英文：Release 的檔名不能有中文（GitHub 會改成 default.txt）
+          cat > dist/FLASHING.txt <<EOF
           韌體 v${ver}（commit ${GITHUB_SHA::7}）ESP-IDF v6.1、esp32c6
 
           A. 保留 flash 裡未確認的喝水事件（建議）：在這個資料夾執行
@@ -102,7 +103,7 @@ jobs:
             label: macOS
           - os: windows-latest
             label: Windows
-          - os: ubuntu-latest
+          - os: ubuntu-24.04      # 固定版本：執行檔只能在 glibc ≥ 建置機器的系統跑（ubuntu-latest 會變新）
             label: Linux
     steps:
       - uses: actions/checkout@v7

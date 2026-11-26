@@ -202,16 +202,23 @@ def read_flash_args(folder: Path) -> list[str]:
     return args
 
 
+# 燒錄說明檔：Release 的檔名不能有中文（GitHub 會改成 default.txt），內容還是中文。舊的 Actions zip 是 燒錄說明.txt
+FLASH_NOTE = "FLASHING.txt"
+_OLD_FLASH_NOTE = "燒錄說明.txt"
+RELEASE_FIRMWARE_FILES = frozenset({"flash_args", "bootloader.bin", "partition-table.bin", "smart_cup_test.bin", FLASH_NOTE})
+
+
 def firmware_version(folder: Path) -> str:
-    note = folder / "燒錄說明.txt"
-    if note.exists():
-        first = note.read_text(encoding="utf-8").splitlines()[0]
-        return first.split("（")[0].replace("韌體", "").strip()
+    for name in (FLASH_NOTE, _OLD_FLASH_NOTE):
+        note = folder / name
+        if note.exists():
+            first = note.read_text(encoding="utf-8").splitlines()[0]
+            return first.split("（")[0].replace("韌體", "").strip()
     return "本機建置"
 
 
 def download_latest_release(dest: Path, log) -> Path:
-    """從 GitHub Release（推 v* tag 時 Actions 自動建立）下載最新版的燒錄檔"""
+    """從 GitHub Release（改版號推上 main 時 Actions 自動建立）下載最新版的燒錄檔"""
     ctx = ssl_context()
     api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
     req = urllib.request.Request(api, headers={"Accept": "application/vnd.github+json", "User-Agent": "cup-tool"})
@@ -220,13 +227,13 @@ def download_latest_release(dest: Path, log) -> Path:
             rel = json.load(r)
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            raise CupError("GitHub 上還沒有 Release（要推 v 開頭的 tag，例如 v0.5.0，Actions 才會建立）")
+            raise CupError("GitHub 上還沒有 Release（改 main/ble_gatt_svr.h 的版號推上 main，Actions 才會建立）")
         raise CupError(f"讀取 GitHub Release 失敗：{e}")
     except OSError as e:
         raise CupError(f"連不上 GitHub：{e}")
-    want = {"flash_args", "bootloader.bin", "partition-table.bin", "smart_cup_test.bin", "燒錄說明.txt"}
+    want = RELEASE_FIRMWARE_FILES
     assets = {a["name"]: a["browser_download_url"] for a in rel.get("assets", [])}
-    missing = want - set(assets) - {"燒錄說明.txt"}
+    missing = want - set(assets) - {FLASH_NOTE}
     if missing:
         raise CupError(f"Release {rel.get('tag_name')} 缺少檔案：{', '.join(sorted(missing))}")
     log(f"[韌體] 下載 GitHub Release {rel.get('tag_name')} …")

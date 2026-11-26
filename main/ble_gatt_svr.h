@@ -46,7 +46,7 @@
 
 #define CUP_FW_MAJOR 0
 #define CUP_FW_MINOR 5
-#define CUP_FW_PATCH 0
+#define CUP_FW_PATCH 1
 
 // App 訂閱 Data Notify 後等多久才補送目前狀態與未確認的事件（太早送，App 可能還沒準備好接收而漏掉）
 #define SUBSCRIBE_RESEND_MS 1500

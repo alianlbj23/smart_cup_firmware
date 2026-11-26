@@ -22,7 +22,7 @@
   且**不做自我更新**（只在紀錄提示有新版）。
 
 ### Release 資產（合約）
-- 韌體：沿用現有檔名（`flash_args`、`*.bin`、`燒錄說明.txt`…）。
+- 韌體：沿用現有檔名（`flash_args`、`*.bin`…），燒錄說明改名 `FLASHING.txt`（Release 檔名不能有中文）。
 - 工具：`SmartCupTool-macOS.zip`（ditto 壓的 .app）、`SmartCupTool-Windows.zip`（`SmartCupTool.exe`）、
   `SmartCupTool-Linux.zip`（`SmartCupTool` 單一執行檔）。
 - `SHA256SUMS.txt`：所有資產的 `sha256  檔名`。工具更新時**沒有這個檔或雜湊不符就拒絕更新**。
@@ -44,7 +44,7 @@
 
 ### CI（`.github/workflows/build.yml`）
 - `host-test` 加跑 `pytest tools/tests`。
-- `tool` matrix 加 Linux（ubuntu-latest，`xvfb-run` 跑 `--self-test`）；三平台都寫 `VERSION` 並 `--add-data`。
+- `tool` matrix 加 Linux（固定 ubuntu-24.04，glibc 2.39，避免 runner 升級後舊系統跑不起來；`xvfb-run` 跑 `--self-test`）；三平台都寫 `VERSION` 並 `--add-data`。
 - 移除各 job 裡的 Release 步驟，改成最後一個 `release` job：只在 push main 跑（使用者決定：手動推 tag 不發版），
   下載全部 Artifacts、產生 `SHA256SUMS.txt`；已有發布過且含 `SHA256SUMS.txt` 的 `v<版號>` Release 就跳過。
   先上傳到 draft，全部上傳完才發布（發布時才建 tag），中途失敗重跑能補上；main 不 cancel-in-progress。

@@ -109,7 +109,7 @@ idf.py -p /dev/ttyACM0 flash monitor
 每次推上 main、開 PR，GitHub Actions（[.github/workflows/build.yml](.github/workflows/build.yml)）都會先跑喝水偵測的單元測試，再用 ESP-IDF v6.1 建置 esp32c6 韌體，並把校正工具打包成 macOS App、Windows 和 Linux 執行檔（見[第 4 節](#用校正工具建議韌體-050-起)）。**最簡單的燒法是用校正工具的「燒錄韌體」**，下面是不用工具的做法。
 
 1. 到 GitHub 的 **Actions** 分頁 →「韌體建置」→ 點最新一次成功的執行，在最下面的 **Artifacts** 下載 `smart_cup_firmware-v<版本>-<commit>`（保留 90 天）。
-2. 解壓縮，裡面有 `燒錄說明.txt`。只需要 Python 的 esptool（`pip install esptool`），兩種燒法：
+2. 解壓縮，裡面有 `FLASHING.txt`（燒錄說明）。只需要 Python 的 esptool（`pip install esptool`），兩種燒法：
 
 ```bash
 # A. 建議：分開燒 bootloader、分割表、程式，flash 裡未確認的喝水事件會保留
@@ -208,7 +208,7 @@ MPR121 的充電時間設定在 [main/main.c](main/main.c)：
 
 - **不裝 Python**：到 GitHub 最新的 **Release** 下載 `SmartCupTool-macOS.zip`（App）、`SmartCupTool-Windows.zip`（exe）或 `SmartCupTool-Linux.zip`（單一執行檔），解壓後雙擊／執行（還沒發版的 commit 在 **Actions** 分頁 → 該次執行的 Artifacts）。
   - macOS：第一次開會說「無法驗證開發者」（沒有簽章）：在 Finder 對 App **按右鍵 →「打開」**，之後就能直接開。**先把 App 搬到「應用程式」資料夾**，直接從「下載」執行時無法自動更新。
-  - Linux：使用者要在 `dialout` 群組才能開序列埠（`sudo usermod -aG dialout $USER`，重新登入後生效）。執行檔在 GitHub 的 `ubuntu-latest`（Ubuntu 24.04）建置，需要 glibc 2.39 以上；更舊的發行版請從原始碼執行。
+  - Linux：使用者要在 `dialout` 群組才能開序列埠（`sudo usermod -aG dialout $USER`，重新登入後生效）。執行檔固定在 GitHub 的 `ubuntu-24.04` 建置，需要 glibc 2.39 以上（Ubuntu 24.04、Debian 13 以後）；更舊的發行版請從原始碼執行。
 - **用 Python 跑**：Python 要有 Tkinter（macOS 用 python.org 的安裝檔；Homebrew 的要 `brew install python-tk@3.13`；Linux 要 `sudo apt install python3-tk`）
 
 ```bash
@@ -361,7 +361,7 @@ idf.py -p /dev/ttyACM0 flash monitor
 | Byte | 內容 |
 |---|---|
 | 0 | 電量 %，`0xFF` = 未知（沒接電池） |
-| 1..3 | 韌體版本 major、minor、patch（目前 **0.5.0**） |
+| 1..3 | 韌體版本 major、minor、patch（目前 **0.5.1**） |
 | 4..9 | 杯子的 BLE 位址 6 bytes，**顯示順序**（最高位元組在前）。例：位址 `58:E6:C5:12:E0:CE` → `58 E6 C5 12 E0 CE`（韌體 0.4.0 新增） |
 
 - 舊 App 只讀前 4 bytes，不受影響。App 讀到長度 ≥ 10 時，把後 6 bytes 組成大寫、冒號分隔的字串當 `cup_hardware_id`（iOS 拿不到 BLE 位址，只能靠這個）；長度 < 10 時用手機平台給的 remoteId。
