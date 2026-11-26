@@ -77,6 +77,22 @@ Linux 和 macOS 都可以開發，ESP-IDF 都裝在 `~/.espressif/v6.1/esp-idf`�
 
 用 VS Code 的話，`.vscode/settings.json` 兩台共用：ESP-IDF 路徑寫成 `${env:HOME}/…`、序列埠設成 `detect`（自動偵測）。不要用「ESP-IDF: Select Current ESP-IDF Version」重新選版本，它會把路徑寫死成這台機器的。要開**本專案的資料夾**，不要開上一層。開錯的話，狀態列的建置、燒錄按鈕會在錯的目錄執行，出現「沒有 CMakeLists.txt」或「找不到 sdkconfig」的錯誤。
 
+### 擋敏感資料上傳（clone 後做一次）
+
+```bash
+bash tools/setup_hooks.sh      # 選 1「安裝／更新 hook」
+```
+
+會下載固定版本的 gitleaks（8.30.1，比對 SHA256）到 `.tools/`，並啟用 `.githooks/`：
+
+- `git commit` 前：檢查這次要 commit 的檔案。`git push` 前：檢查要推上去的 commit。
+- 擋兩種東西：敏感檔名（`.env`、`*.pem`、`*.key`、`id_rsa`、`credentials.json`、ESP32 的 flash 加密金鑰等，見 `tools/secret_guard.py` 的 `BLOCKED_NAMES`），以及 gitleaks 抓到的 API key、token、密碼、私鑰內容。
+- 擋下時會列出檔案和行數，金鑰本身會遮住。內容誤判的話，在那一行加註解 `gitleaks:allow`，或把 gitleaks 給的 Fingerprint 加進 `.gitleaksignore`；檔名誤判（例如要 commit 公開的 `ca_cert.pem`），把路徑 glob（例如 `main/certs/*_cert.pem`）一行一個加進 `.secret-guard-allow`。
+- merge commit 裡解衝突時寫進去的東西、改名成敏感檔名的檔案也會擋。
+- 金鑰已經推上去的話，刪掉檔案不夠（git 歷史裡還在），要去那個服務撤銷、重新產生。
+- GitHub Actions 每次推上任何分支、開 PR 都會掃整個 git 歷史（`.github/workflows/secret-scan.yml`），沒過就不發版。`git commit --no-verify` 可以略過本機的 hook，但躲不過 CI。PR 用 base 分支（例如 main）的掃描程式和 `.secret-guard-allow`，PR 裡改規則不會讓自己過關。
+- 注意：CI 是推上去**之後**才掃，真正能事前擋住的只有本機 hook，所以每台電腦 clone 後都要裝。
+
 ---
 
 ## 3. 燒錄
@@ -594,10 +610,13 @@ sdkconfig.defaults   主控台走 USB Serial/JTAG、4MB Flash、NimBLE、電源�
 tools/read_levels.py 校正用：錄一段電極讀值並算平均
 tools/cup_tool.py    校正工具（視窗程式）：量空杯／滿杯、寫入校正值、燒錄韌體；套件見 tools/requirements-cup-tool.txt
 tools/cup_updater.py 校正工具的自動更新（查 Release、下載、比對 SHA256SUMS.txt、替換）；測試在 tools/tests/（開發套件 tools/requirements-dev.txt）
+tools/secret_guard.py  擋敏感資料：敏感檔名＋gitleaks（git hook 和 CI 共用）；tools/setup_hooks.sh 安裝 hook（選單）
+.githooks/           pre-commit、pre-push hook（呼叫 secret_guard.py）
 tools/ble_check.py   用電腦模擬 App 測試 BLE（含 0x07 的 ACK；--no-ack 測重送）
 test/host/           cup_state.c 事件偵測、Device Status 內容的單元測試，在電腦上跑（sh test/host/run.sh）
 tools/ble_watch.py   休眠測試：印出 BLE 廣播出現／消失的時間軸
 docs/wiring.pdf      接線圖、電極尺寸、接線順序
-.github/workflows/build.yml  GitHub Actions：單元測試 → ESP-IDF v6.1 建置韌體、打包校正工具（macOS／Windows／Linux）→ 上傳；版號改了推上 main 自動建 tag 和 Release
+.github/workflows/secret-scan.yml  GitHub Actions：敏感資料掃描（整個 git 歷史）；main／PR 由 build.yml 呼叫，其他分支 push 時自己跑
+.github/workflows/build.yml  GitHub Actions：敏感資料掃描、單元測試 → ESP-IDF v6.1 建置韌體、打包校正工具（macOS／Windows／Linux）→ 上傳；版號改了推上 main 自動建 tag 和 Release
 HANDOFF.md           開發交接筆記（ESP-IDF v6 注意事項、已踩過的坑）
 ```

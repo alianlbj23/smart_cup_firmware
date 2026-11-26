@@ -1,4 +1,5 @@
 # 自動建置：每次推上 main、開 PR、或手動執行時
+#   0. 敏感資料掃描（secret-scan.yml：敏感檔名＋gitleaks，整個 git 歷史）
 #   1. 喝水偵測單元測試、校正工具 pytest
 #   2. 用 ESP-IDF v6.1（esp32c6）建置韌體 → Artifacts 放燒錄檔
 #   3. 把校正工具（tools/cup_tool.py）打包成 macOS App、Windows 執行檔、Linux 執行檔 → Artifacts
@@ -36,8 +37,17 @@ jobs:
         run: python -m pip install -r tools/requirements-dev.txt
       - name: 校正工具語法檢查
         run: python -m py_compile tools/cup_tool.py tools/cup_updater.py
+      # secret_guard 的整合測試要用 .tools/gitleaks；REQUIRE_GITLEAKS=1 時沒裝就失敗，不會被略過
+      - name: 安裝 gitleaks（secret_guard 測試用）
+        run: python tools/secret_guard.py install
       - name: 校正工具單元測試（pytest）
+        env:
+          REQUIRE_GITLEAKS: '1'
         run: python -m pytest tools/tests -q
+
+  secret-scan:
+    name: 敏感資料掃描
+    uses: ./.github/workflows/secret-scan.yml
 
   build:
     name: idf.py build（ESP-IDF v6.1、esp32c6）
@@ -153,7 +163,7 @@ jobs:
   release:
     name: 發版（版號改了才建 Release）
     runs-on: ubuntu-latest
-    needs: [build, tool]
+    needs: [build, tool, secret-scan]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write   # 建 tag、Release

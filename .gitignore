@@ -76,3 +76,40 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# 敏感資料（tools/secret_guard.py 的 hook 和 CI 也會擋）
+.tools/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.ppk
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+credentials.json
+service-account*.json
+.netrc
+.pypirc
+.npmrc
+.claude/settings.local.json
+*.env
+*.p8
+*.kdbx
+*.tfstate
+secrets.json
+secrets.yaml
+secrets.yml
+secrets.toml
+.git-credentials
+.htpasswd
+*flash_encryption_key*.bin
+nvs_keys*.bin

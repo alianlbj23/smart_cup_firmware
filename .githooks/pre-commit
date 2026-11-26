@@ -1,0 +1,17 @@
+#!/bin/sh
+# 敏感資料檢查（tools/secret_guard.py）：有 .env、私鑰、API key、token 等就擋下 pre-commit。
+# 安裝／移除：bash tools/setup_hooks.sh
+root=$(git rev-parse --show-toplevel) || exit 1
+# 實際執行一次才算找到（Windows 的 python3 可能是 Microsoft Store 的替身，執行會失敗）
+py=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c "import sys; sys.exit(sys.version_info < (3, 9))" >/dev/null 2>&1; then
+    py=$c
+    break
+  fi
+done
+if [ -z "$py" ]; then
+  echo "[secret-guard] 找不到 Python 3.9 以上，沒辦法檢查敏感資料，先擋下（git commit --no-verify 可強制略過）" >&2
+  exit 1
+fi
+exec "$py" "$root/tools/secret_guard.py" pre-commit "$@"
