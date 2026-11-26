@@ -1,5 +1,8 @@
-# 韌體自動建置：每次推上 main、開 PR、或手動執行時，用 ESP-IDF v6.1（esp32c6）建置，
-# 產生的燒錄檔放在該次執行的 Artifacts（保留 90 天）。推 v* 的 tag（例如 v0.4.0）時，另外建立 GitHub Release 附上燒錄檔。
+# 自動建置：每次推上 main、開 PR、或手動執行時
+#   1. 喝水偵測單元測試
+#   2. 用 ESP-IDF v6.1（esp32c6）建置韌體 → Artifacts 放燒錄檔
+#   3. 把校正工具（tools/cup_tool.py）打包成 macOS App、Windows 執行檔 → Artifacts
+# 檔案放在該次執行的 Artifacts（保留 90 天）。推 v* 的 tag（例如 v0.5.0）時，另外建立 GitHub Release 附上全部檔案。
 name: 韌體建置
 
 on:
@@ -24,6 +27,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: 編譯並執行 test/host
         run: sh test/host/run.sh
+      - name: 校正工具語法檢查
+        run: python3 -m py_compile tools/cup_tool.py
 
   build:
     name: idf.py build（ESP-IDF v6.1、esp32c6）
@@ -84,3 +89,50 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  tool:
+    name: 校正工具（${{ matrix.label }}）
+    runs-on: ${{ matrix.os }}
+    needs: host-test
+    permissions:
+      contents: write   # 推 tag 時附到 Release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest      # Apple Silicon
+            label: macOS
+          - os: windows-latest
+            label: Windows
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: 安裝套件
+        run: python -m pip install -r tools/requirements-cup-tool.txt pyinstaller
+      - name: 打包（macOS）
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --noconfirm --windowed --name SmartCupTool --collect-data esptool tools/cup_tool.py
+          dist/SmartCupTool.app/Contents/MacOS/SmartCupTool --self-test
+          ditto -c -k --keepParent dist/SmartCupTool.app SmartCupTool-macOS.zip
+      - name: 打包（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name SmartCupTool --collect-data esptool tools/cup_tool.py
+          $p = Start-Process dist/SmartCupTool.exe -ArgumentList '--self-test' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "self-test 失敗（$($p.ExitCode)）" }
+          Compress-Archive dist/SmartCupTool.exe SmartCupTool-Windows.zip
+      - name: 上傳 Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: SmartCupTool-${{ matrix.label }}-${{ github.sha }}
+          path: SmartCupTool-${{ matrix.label }}.zip
+          if-no-files-found: error
+      - name: 附到 Release（只有推 v* tag 時）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: SmartCupTool-${{ matrix.label }}.zip

@@ -43,6 +43,7 @@
 #include "cup_state.h"
 #include "ble_gatt_svr.h"
 #include "drink_log.h"
+#include "tool_cmd.h"
 
 /* ========================================================================== */
 /*  腳位（XIAO ESP32-C6 的 Dx 標示 → GPIO 編號）                                */
@@ -1258,7 +1259,8 @@ static void doze_loop(uint32_t idle_ms, const cup_motion_t *last)
     float sent_pct = -100.0f;
     (void)cup_water_get(&sent_pct);
 
-    while (gpio_get_level(PIN_IMU_INT) == 0) {
+    // 杯子被拿起（D1）或電腦的校正工具送指令（要即時量測）就醒來
+    while (gpio_get_level(PIN_IMU_INT) == 0 && !tool_cmd_active()) {
         vTaskDelay(pdMS_TO_TICKS(DOZE_POLL_MS));
         uint32_t now = uptime_ms();
         uint32_t secs = (now - start) / 1000;
@@ -1319,7 +1321,7 @@ static void doze_loop(uint32_t idle_ms, const cup_motion_t *last)
     cup_event_wake(drink_log_clock_ms());   // 喚醒 = 杯子被動到，視為離開穩定
     ble_cup_set_low_power(false);
     ble_cup_send_state(CUP_STATE_ACTIVE, 0);
-    printf("[休眠] 偵測到移動，喚醒（休眠了 %" PRIu32 " 秒）\n", dozed_s);
+    printf("[休眠] %s，喚醒（休眠了 %" PRIu32 " 秒）\n", tool_cmd_active() ? "校正工具送來指令" : "偵測到移動", dozed_s);
 }
 
 // 欄寬（以終端機顯示寬度計算，中文字算 2 格）
@@ -1422,6 +1424,11 @@ static void live_loop(void)
                 cup_water_add_sample(e0, have_motion ? motion.water_ok : true);
             }
         }
+        // 給電腦校正工具的即時資料（工具寫入的新校正值也在這裡套用）
+        tool_cmd_feed(&(tool_sample_t){
+            .have_e = have_e, .e0 = e0, .e1 = e1,
+            .have_motion = have_motion, .pose = motion.pose, .moving = motion.moving,
+        });
 
         // ---- 喝水／加水事件（沒有 IMU 時看不出拿起放下，不偵測）----
         if (have_motion) {
@@ -1480,7 +1487,7 @@ static void live_loop(void)
         }
         int32_t sleep_left_ms = -1;
         if (have_motion) {   // 沒有 IMU（休眠後叫不醒）時不休眠
-            if (idle_ms >= DOZE_IDLE_MS) {
+            if (idle_ms >= DOZE_IDLE_MS && !tool_cmd_active()) {   // 校正工具連著時不休眠
                 doze_loop(idle_ms, &motion);   // 杯子被拿起才返回
                 // 回到即時量測：重新開始計時，馬上補送一次姿態與水位
                 tick = 0;
@@ -1495,8 +1502,8 @@ static void live_loop(void)
             sleep_left_ms = (int32_t)(DOZE_IDLE_MS - idle_ms);
         }
 
-        // ---- 序列埠顯示 ----
-        if (tick % PRINT_EVERY == 0) {
+        // ---- 序列埠顯示（校正工具連著時不印，避免和工具的 @ 回覆混在一起）----
+        if (tick % PRINT_EVERY == 0 && !tool_cmd_active()) {
             if (row % LIVE_HEADER_EVERY == 0) {
                 print_live_header();
             }
@@ -1676,6 +1683,9 @@ void app_main(void)
     if (nvs_err == ESP_OK) {
         drink_log_init(s_woke_from_sleep);
     }
+
+    // 水位校正值（flash 裡有就用，沒有用預設）、電腦校正工具的序列埠指令（tools/cup_tool.py）
+    tool_cmd_init();
 
     // BLE：廣播 SmartCup-XXXX，App 連上並訂閱後開始推送水位、姿態
     err = ble_cup_init();

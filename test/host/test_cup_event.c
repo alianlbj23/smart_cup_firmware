@@ -832,6 +832,44 @@ static void t_status(void)
     }
 }
 
+static void t_calibration(void)
+{
+    printf("水位校正值：預設、換成新值、拒絕不合理的值\n");
+    uint16_t e, f, de, df;
+    cup_water_default_calibration(&de, &df);
+    cup_water_get_calibration(&e, &f);
+    CHECK(e == de && f == df);
+    CHECK(near(cup_water_e0_to_pct((float)de), 0.0f));
+    CHECK(near(cup_water_e0_to_pct((float)df), 100.0f));
+
+    CHECK(cup_water_set_calibration(500, 300));
+    cup_water_get_calibration(&e, &f);
+    CHECK(e == 500 && f == 300);
+    CHECK(near(cup_water_e0_to_pct(400.0f), 50.0f));
+    CHECK(near(cup_water_e0_to_pct(520.0f), 0.0f));     // 比空杯還高 → 截成 0
+    CHECK(near(cup_water_e0_to_pct(250.0f), 100.0f));   // 比滿杯還低 → 截成 100
+
+    // 已經有的水位馬上用新的校正值換算（存的是讀值，不是 %）
+    for (int i = 0; i < 10; i++) {
+        cup_water_add_sample(400, true);
+    }
+    float pct;
+    CHECK(cup_water_get(&pct) && near(pct, 50.0f));
+    CHECK(cup_water_set_calibration(450, 350));
+    CHECK(cup_water_get(&pct) && near(pct, 50.0f));
+    CHECK(cup_water_set_calibration(400, 300));
+    CHECK(cup_water_get(&pct) && near(pct, 0.0f));
+
+    CHECK(!cup_water_set_calibration(300, 400));    // 滿杯 ≥ 空杯
+    CHECK(!cup_water_set_calibration(400, 400));
+    CHECK(!cup_water_set_calibration(400, 390));    // 差距太小
+    CHECK(!cup_water_set_calibration(1100, 300));   // 超過 10 bits
+    cup_water_get_calibration(&e, &f);
+    CHECK(e == 400 && f == 300);                    // 不合理的值不會改掉原本的
+
+    CHECK(cup_water_set_calibration(de, df));       // 還原，免得影響其他測試
+}
+
 int main(void)
 {
     t_first_settle_only_baseline();
@@ -858,6 +896,7 @@ int main(void)
     t_static_disabled();
 #endif
     t_status();
+    t_calibration();
     if (s_fail) {
         printf("\n%d 項失敗（共 %d 項檢查）\n", s_fail, s_checks);
         return 1;

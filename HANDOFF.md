@@ -10,6 +10,7 @@
 - **已完成**：姿態（俯仰／翻滾／傾斜、直立／傾斜／飲用中／倒下、移動判斷）與「水位只在直立靜止時更新」，在 `main/cup_state.c`
 - **已完成**：休眠（README 第 6 節）。**預設是淺眠、BLE 連線不斷**（使用者不想看到斷線／重新連線）：靜止 30 秒 → IMU wake-on-motion、連線間隔拉長、CPU 自動淺眠（esp_pm），新增 STATE 封包（0x06）讓 App 顯示「水杯休眠中」。深度睡眠保留成選項 `DEEP_SLEEP_ENABLE`（預設 0）。App 端也加了「找不到水杯時每 20 秒背景重試」，深度睡眠模式時用得到
 - **耗電**：C6 沒有 32 kHz 晶振，BLE 淺眠用主晶振，官方數據約 3.3 mA，粗估電池撐 4～5 天（沒實測）。要更省電：開深度睡眠，或硬體加 32 kHz 晶振
+- **已完成（2026-11-26，韌體 0.5.0）**：**校正工具**。水位校正值改存 NVS（namespace `cupcal`，key `e0_empty`／`e0_full`），開機載入，沒有才用 `cup_state.c` 的預設值；`main/tool_cmd.c` 在 USB 序列埠收指令（`PING`、`CAL?`、`CAL SET`、`CAL RESET`、`MEASURE`、`LIVE`，回覆都是 `@` 開頭一行）。電腦端 `tools/cup_tool.py`（Tkinter）：連線、量空杯／滿杯（5 秒平均）、檢查（跳動、沒直立靜止、差距太小、RL 沒變化 = 杯子沒壓到底）、寫入、恢復預設、燒錄韌體（GitHub Release／Actions zip／本機 build，用 flash_args 分開燒，保留 NVS）。Actions 會用 PyInstaller 打包成 macOS App、Windows exe（打包後跑 `--self-test`）。實機測過：指令、寫入後重開機保留、恢復預設、程式內呼叫 esptool 燒錄 build/（6 秒）、打包後的 macOS App self-test；**視窗操作本身還沒有人實際點過**
 - **已完成（2026-11-26）**：GitHub Actions 自動建置（`.github/workflows/build.yml`）：推上 main／PR／手動執行 → host 單元測試 → `espressif/esp-idf-ci-action` 在 `espressif/idf:v6.1` 容器裡 `idf.py build && idf.py merge-bin` → Artifacts 上傳燒錄檔；推 `v*` tag 建立 Release。merged 檔從 0x0 蓋到程式結尾，會把中間的 NVS（0x9000～0xEFFF）填成 0xFF，**燒 merged 檔會清掉未確認的喝水事件**，平常用 `write-flash @flash_args`
 - **已完成（2026-11-24，還沒實機測）**：韌體端偵測喝水／加水（`cup_state.c` 的 `cup_event_*`，規則照 App 的 `lib/state/drink_detector.dart`），新封包 0x07 DRINK_EVENT，事件存 NVS（`main/drink_log.c`）、App 回 3-byte ACK 才刪除、重新訂閱後補傳。韌體版本 **0.3.0**：App 看到 ≥ 0.3.0 要關掉自己的偵測，連線中的事件也只由韌體送。格式見 README 第 5 節「喝水／加水事件」。偵測邏輯有 host 單元測試（`sh test/host/run.sh`）；NVS 儲存、補傳、ACK 只有編譯過，還沒實機驗證
 - **已寫完（2026-11-25，韌體 0.4.0）——沒有編譯過、沒有燒錄、沒有實機測**。寫的那台機器沒有 ESP-IDF，也沒有接水杯。介面依據是 `food_intake-viz/docs/smart-cup/CONTRACT.md` §1（韌體 ↔ App ↔ Server 的合約，改介面要先改那份）：
@@ -169,4 +170,5 @@
 - **用 Python 打開序列埠會讓板子重開機**（USB Serial/JTAG）：即使 DTR、RTS 都設 False，每次打開序列埠板子還是會重跑開機測試。錄資料時要丟掉時間倒退之前的舊行。另外 `idf.py monitor` 開著時，其他程式讀不到這個序列埠。
 - **D1（GPIO1）、D2（GPIO2）都在 ESP32-C6 的 LP GPIO 範圍內**（GPIO0～7），理論上可以當深度睡眠的喚醒來源。實作前要用 v6.1 的標頭檔和文件確認。
 - **MPR121 的 IRQ 每 0.5 秒才讀一次狀態（0x00）來清除**，所以很快點一下可能只算到一次下降緣。
-- **使用者偏好**：畫面訊息用繁體中文，程式碼加中文註解。使用者只看 monitor，不會從序列埠輸入任何東西。
+- **使用者偏好**：畫面訊息用繁體中文，程式碼加中文註解。使用者平常只看 monitor；0.5.0 起校正工具會從序列埠送指令（`tool_cmd.c`），收到指令後 60 秒內不休眠、不印表格。
+- **打開序列埠會讓板子重開機（macOS 也會）**：不是每次，但常常發生。工具連線時每秒送一次 PING，等到 `@PONG`（開機約 5 秒後指令模組才啟動），不能一打開就送指令。0.5.0 起裝了 USB Serial/JTAG 驅動（printf 也走驅動：送不出去最多等 50 ms 就丟掉，沒接電腦不會卡住；驅動本身不擋自動淺眠）

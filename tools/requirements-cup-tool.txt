@@ -1,0 +1,4 @@
+# tools/cup_tool.py（校正工具）用的套件：pip install -r tools/requirements-cup-tool.txt
+pyserial>=3.5
+esptool>=5.0
+certifi

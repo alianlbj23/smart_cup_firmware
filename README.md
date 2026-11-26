@@ -106,7 +106,7 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 ### 不裝 ESP-IDF：用 GitHub 自動建好的檔案燒錄
 
-每次推上 main、開 PR，GitHub Actions（[.github/workflows/build.yml](.github/workflows/build.yml)）都會先跑喝水偵測的單元測試，再用 ESP-IDF v6.1 建置 esp32c6 韌體。
+每次推上 main、開 PR，GitHub Actions（[.github/workflows/build.yml](.github/workflows/build.yml)）都會先跑喝水偵測的單元測試，再用 ESP-IDF v6.1 建置 esp32c6 韌體，並把校正工具打包成 macOS App 和 Windows 執行檔（見[第 4 節](#用校正工具建議韌體-050-起)）。**最簡單的燒法是用校正工具的「燒錄韌體」**，下面是不用工具的做法。
 
 1. 到 GitHub 的 **Actions** 分頁 →「韌體建置」→ 點最新一次成功的執行，在最下面的 **Artifacts** 下載 `smart_cup_firmware-v<版本>-<commit>`（保留 90 天）。
 2. 解壓縮，裡面有 `燒錄說明.txt`。只需要 Python 的 esptool（`pip install esptool`），兩種燒法：
@@ -115,14 +115,14 @@ idf.py -p /dev/ttyACM0 flash monitor
 # A. 建議：分開燒 bootloader、分割表、程式，flash 裡未確認的喝水事件會保留
 python -m esptool --chip esp32c6 -p <序列埠> -b 460800 write-flash @flash_args
 
-# B. 單一檔案：從 0x0 整段蓋過去，中間的 NVS 區也會被清空（未確認的喝水事件、boot_id 會不見）
+# B. 單一檔案：從 0x0 整段蓋過去，中間的 NVS 區也會被清空（校正值、未確認的喝水事件、boot_id 都會不見）
 python -m esptool --chip esp32c6 -p <序列埠> -b 460800 write-flash 0x0 smart_cup_firmware-v<版本>-<commit>-merged.bin
 ```
 
 要發正式版本時推一個 `v` 開頭的 tag（版本號跟 `ble_gatt_svr.h` 的 `CUP_FW_*` 一致），會自動建立 GitHub Release 附上這些檔案：
 
 ```bash
-git tag v0.4.0 && git push origin v0.4.0
+git tag v0.5.0 && git push origin v0.5.0
 ```
 
 GitHub 上建置失敗時（例如編譯警告，v6 會當成錯誤），Actions 分頁會顯示紅色叉叉，點進去看 log。
@@ -172,13 +172,14 @@ MPR121 讀到的是電極充電後的電壓。水越多，主條的電容越大�
 水位換算在 [main/cup_state.c](main/cup_state.c)：
 
 ```c
-// 水位校正值：電極0 在空杯、滿杯時的讀值
+// 預設的水位校正值（flash 裡沒有工具寫入的校正值時才用）：電極0 在空杯、滿杯時的讀值
 #define LEVEL_E0_EMPTY          480
 #define LEVEL_E0_FULL           356
 
-static float e0_to_pct(float e0)
+// s_cal_empty／s_cal_full：開機時是預設值，main.c 從 NVS 載入、校正工具寫入時換掉
+float cup_water_e0_to_pct(float e0)
 {
-    float pct = (LEVEL_E0_EMPTY - e0) * 100.0f / (float)(LEVEL_E0_EMPTY - LEVEL_E0_FULL);
+    float pct = ((float)s_cal_empty - e0) * 100.0f / (float)(s_cal_empty - s_cal_full);
     if (pct < 0.0f) pct = 0.0f;
     if (pct > 100.0f) pct = 100.0f;
     return pct;
@@ -203,7 +204,38 @@ MPR121 的充電時間設定在 [main/main.c](main/main.c)：
 
 以上都沒發生的話，不用校正，直接用[第 3 節](#3-燒錄)燒錄就好。
 
-### 校正步驟
+### 用校正工具（建議，韌體 0.5.0 起）
+
+韌體 0.5.0 起，校正值存在水杯的 flash（NVS），用電腦的**校正工具**量測並寫入，不用改程式、不用重新編譯燒錄。重開機、燒錄新韌體（用 `flash_args` 燒）都會保留。flash 裡沒有校正值時，才用程式裡的預設值（`cup_state.c` 的 `LEVEL_E0_EMPTY`／`LEVEL_E0_FULL`）。
+
+**取得工具**（擇一）：
+
+- **不裝 Python**：GitHub 的 **Actions** 分頁 →「韌體建置」→ 最新一次成功的執行 → Artifacts 下載 `SmartCupTool-macOS-…` 或 `SmartCupTool-Windows-…`，解壓後雙擊。macOS 第一次開會說「無法驗證開發者」（沒有簽章）：在 Finder 對 App **按右鍵 →「打開」**，之後就能直接開。
+- **用 Python 跑**（Linux 用這個）：Python 要有 Tkinter（macOS 用 python.org 的安裝檔；Homebrew 的要 `brew install python-tk@3.13`；Linux 要 `sudo apt install python3-tk`）
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r tools/requirements-cup-tool.txt
+.venv/bin/python tools/cup_tool.py
+```
+
+**使用步驟**（先關掉 VS Code 的 monitor，同一個序列埠一次只能給一個程式用）：
+
+1. 水杯用 USB 線接電腦 → 選「★ 水杯（ESP32）」那個序列埠 → **連線**。板子可能會重開機，約 5 秒後連上，上方會顯示韌體版本和目前的校正值，「即時讀值」開始跳動。
+2. 杯子**擦乾、壓到保護套底部**、直立放好、手離開 → **量空杯**（5 秒）。
+3. 倒水到**水面和主條銅箔頂端切齊** → **量滿杯**（5 秒）。
+4. 下面會自動填入要寫入的空杯／滿杯值並檢查，有問題會顯示 ⚠ → **寫入水杯**。馬上生效，看「即時讀值」驗證：滿杯約 100%，倒掉擦乾後約 0%。
+5. 不滿意可以重量，或按**恢復程式預設值**。
+
+工具會自動檢查的：讀值跳動太大（杯子在動、手太近）、量測期間不是直立靜止、空杯和滿杯差距太小、**杯底 RL 從空杯到滿杯幾乎沒變**（杯子沒壓到保護套底部，滿杯會少算約 10%）。
+
+工具的「燒錄韌體」可以燒 GitHub 最新 Release、Actions 下載的 zip、或本機的 `build/`，都用 `flash_args` 分開燒，**會保留 flash 裡的校正值和未確認的喝水事件**。
+
+工具和水杯之間的序列埠指令（也可以在 `idf.py monitor` 裡直接打）見 [main/tool_cmd.h](main/tool_cmd.h)：`PING`、`CAL?`、`CAL SET <空杯> <滿杯>`、`CAL RESET`、`MEASURE <毫秒>`、`LIVE 1`、`HELP`。
+
+### 手動校正步驟（不用工具）
+
+這是 0.5.0 以前的做法：量到的數字改成程式的**預設值**再重新燒錄。**flash 裡有工具寫入的校正值時，會優先用 flash 的值**，要讓預設值生效，先在工具按「恢復程式預設值」（或在 monitor 打 `CAL RESET`）。
 
 用的是同一份韌體，不用另外燒「校正版」。量的時候手不要碰杯子或保護套：手的電容比水位變化大很多，讀數會亂跳。
 
@@ -322,7 +354,7 @@ idf.py -p /dev/ttyACM0 flash monitor
 | Byte | 內容 |
 |---|---|
 | 0 | 電量 %，`0xFF` = 未知（沒接電池） |
-| 1..3 | 韌體版本 major、minor、patch（目前 **0.4.0**） |
+| 1..3 | 韌體版本 major、minor、patch（目前 **0.5.0**） |
 | 4..9 | 杯子的 BLE 位址 6 bytes，**顯示順序**（最高位元組在前）。例：位址 `58:E6:C5:12:E0:CE` → `58 E6 C5 12 E0 CE`（韌體 0.4.0 新增） |
 
 - 舊 App 只讀前 4 bytes，不受影響。App 讀到長度 ≥ 10 時，把後 6 bytes 組成大寫、冒號分隔的字串當 `cup_hardware_id`（iOS 拿不到 BLE 位址，只能靠這個）；長度 < 10 時用手機平台給的 remoteId。
@@ -548,14 +580,16 @@ BLE 的連線間隔在 [main/ble_gatt_svr.c](main/ble_gatt_svr.c) 的 `k_conn_fa
 main/main.c          接線測試、即時量測迴圈、序列埠顯示、休眠（淺眠／深度睡眠）、MPR121／IMU／電池讀取
 main/cup_state.c/.h  水位換算與保持、姿態（俯仰／翻滾／傾斜、分類、移動判斷）、喝水／加水事件偵測、電量 %（純計算）
 main/drink_log.c/.h  喝水事件存 flash（NVS 環形佇列）、ACK、對時換算、補傳
+main/tool_cmd.c/.h   校正工具的 USB 序列埠指令；水位校正值存 NVS（0.5.0 起）
 main/ble_gatt_svr.c/.h  BLE GATT Server（NimBLE）：廣播、對時、Data Notify、ACK、Device Status
 main/CMakeLists.txt  用到的 ESP-IDF 元件（esp_driver_i2c、esp_driver_gpio、esp_adc、esp_timer、bt、nvs_flash、esp_driver_usb_serial_jtag、esp_pm）
 sdkconfig.defaults   主控台走 USB Serial/JTAG、4MB Flash、NimBLE、電源管理（自動淺眠）
 tools/read_levels.py 校正用：錄一段電極讀值並算平均
+tools/cup_tool.py    校正工具（視窗程式）：量空杯／滿杯、寫入校正值、燒錄韌體；套件見 tools/requirements-cup-tool.txt
 tools/ble_check.py   用電腦模擬 App 測試 BLE（含 0x07 的 ACK；--no-ack 測重送）
 test/host/           cup_state.c 事件偵測、Device Status 內容的單元測試，在電腦上跑（sh test/host/run.sh）
 tools/ble_watch.py   休眠測試：印出 BLE 廣播出現／消失的時間軸
 docs/wiring.pdf      接線圖、電極尺寸、接線順序
-.github/workflows/build.yml  GitHub Actions：單元測試 → ESP-IDF v6.1 建置 → 上傳燒錄檔（推 v* tag 時建立 Release）
+.github/workflows/build.yml  GitHub Actions：單元測試 → ESP-IDF v6.1 建置韌體、打包校正工具（macOS／Windows）→ 上傳（推 v* tag 時建立 Release）
 HANDOFF.md           開發交接筆記（ESP-IDF v6 注意事項、已踩過的坑）
 ```

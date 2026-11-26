@@ -55,6 +55,17 @@ const char *cup_pose_label(cup_pose_t pose);
 // 水位：每次讀到電極0 就呼叫；valid = 這一刻量到的值可信（cup_motion_t.water_ok）
 void cup_water_add_sample(uint16_t e0, bool valid);
 
+// 水位校正值（電極0 在空杯、滿杯時的讀值）。開機時是預設值（cup_state.c 的 LEVEL_E0_*），
+// main.c 從 NVS 載入、tools/cup_tool.py 寫入時用 cup_water_set_calibration 換掉。
+// 不合理的值（滿杯 ≥ 空杯、差距太小、超過 10 bits）回傳 false，校正值不變
+bool cup_water_calibration_valid(uint16_t empty, uint16_t full);
+bool cup_water_set_calibration(uint16_t empty, uint16_t full);
+void cup_water_get_calibration(uint16_t *empty, uint16_t *full);
+void cup_water_default_calibration(uint16_t *empty, uint16_t *full);
+
+// 用目前的校正值把電極0 讀值換成水位 %（0～100，超出的截掉）
+float cup_water_e0_to_pct(float e0);
+
 // 取得目前的水位 %（0～100）。開機後還沒有任何有效讀值時回傳 false。
 bool cup_water_get(float *pct);
 

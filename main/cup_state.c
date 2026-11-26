@@ -8,13 +8,17 @@
 /* ========================================================================== */
 /*  可調參數                                                                    */
 /* ========================================================================== */
-// 水位校正（電極0 的濾波後資料）：水越多讀值越小，兩點之間用直線換算
-// 1 µs 充電時實測（2026-11-26 重新校正，杯子擦乾、壓到保護套底部）：
+// 水位校正（電極0 的濾波後資料）：水越多讀值越小，兩點之間用直線換算。
+// 韌體 0.5.0 起：校正值存在 NVS（用 tools/cup_tool.py 量測並寫入，不必重新編譯），
+// NVS 沒有存過時才用這裡的預設值。
+// 預設值是 1 µs 充電時實測（2026-11-26 重新校正，杯子擦乾、壓到保護套底部）：
 // 空杯 480.2（479～481）；滿杯 = 水面和主條銅箔頂端切齊：356（355～357，連續兩次）。總變化 124
 // 水倒得比銅箔頂端高時讀值會再低（實測過 339），所以 100% 一定要用「切齊銅箔頂端」當標準
 // 注意：杯壁殘留水會讓空杯讀值低約 28；杯子沒壓到底，滿杯會少算約 10%（見 HANDOFF）
 #define LEVEL_E0_EMPTY          480     // 空杯時電極0 的讀值
 #define LEVEL_E0_FULL           356     // 滿杯（水面切齊主條頂端）時電極0 的讀值
+#define LEVEL_E0_MAX            1023    // MPR121 濾波後資料是 10 bits
+#define LEVEL_MIN_SPAN          20      // 空杯 − 滿杯至少要差這麼多才接受（雜訊約 ±1～2，太小換算會亂跳）
 
 // 軸向：IMU 裝在杯底、Z 軸朝上。實際裝好後如果 App 上左右或前後顛倒，把對應的值改成 -1
 #define ROLL_SIGN               (+1.0f)
@@ -188,14 +192,44 @@ const char *cup_pose_label(cup_pose_t pose)
 /* ========================================================================== */
 static uint16_t s_buf[WATER_AVG_N];
 static int s_buf_n, s_buf_pos;
-// 最後一次有效的水位存在 RTC 記憶體：喚醒後杯子還沒放穩前，App 也能先拿到上次的水位
+// 最後一次有效的水位（電極0 平均）存在 RTC 記憶體：喚醒後杯子還沒放穩前，App 也能先拿到上次的水位。
+// 存讀值而不是 %：改校正值後，目前的水位馬上用新的校正值換算
 static RTC_DATA_ATTR bool s_have_water;
-static RTC_DATA_ATTR float s_water_pct;
+static RTC_DATA_ATTR float s_water_e0;
 static bool s_holding = true;
+static uint16_t s_cal_empty = LEVEL_E0_EMPTY;
+static uint16_t s_cal_full = LEVEL_E0_FULL;
 
-static float e0_to_pct(float e0)
+bool cup_water_calibration_valid(uint16_t empty, uint16_t full)
 {
-    float pct = (LEVEL_E0_EMPTY - e0) * 100.0f / (float)(LEVEL_E0_EMPTY - LEVEL_E0_FULL);
+    return empty <= LEVEL_E0_MAX && full < empty && (empty - full) >= LEVEL_MIN_SPAN;
+}
+
+bool cup_water_set_calibration(uint16_t empty, uint16_t full)
+{
+    if (!cup_water_calibration_valid(empty, full)) {
+        return false;
+    }
+    s_cal_empty = empty;
+    s_cal_full = full;
+    return true;
+}
+
+void cup_water_get_calibration(uint16_t *empty, uint16_t *full)
+{
+    *empty = s_cal_empty;
+    *full = s_cal_full;
+}
+
+void cup_water_default_calibration(uint16_t *empty, uint16_t *full)
+{
+    *empty = LEVEL_E0_EMPTY;
+    *full = LEVEL_E0_FULL;
+}
+
+float cup_water_e0_to_pct(float e0)
+{
+    float pct = ((float)s_cal_empty - e0) * 100.0f / (float)(s_cal_empty - s_cal_full);
     if (pct < 0.0f) pct = 0.0f;
     if (pct > 100.0f) pct = 100.0f;
     return pct;
@@ -220,7 +254,7 @@ void cup_water_add_sample(uint16_t e0, bool valid)
         for (int i = 0; i < s_buf_n; i++) {
             sum += s_buf[i];
         }
-        s_water_pct = e0_to_pct((float)sum / s_buf_n);
+        s_water_e0 = (float)sum / s_buf_n;
         s_have_water = true;
         s_holding = false;
     }
@@ -231,7 +265,7 @@ bool cup_water_get(float *pct)
     if (!s_have_water) {
         return false;
     }
-    *pct = s_water_pct;
+    *pct = cup_water_e0_to_pct(s_water_e0);
     return true;
 }
 
