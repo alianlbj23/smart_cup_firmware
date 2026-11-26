@@ -1,0 +1,86 @@
+# 韌體自動建置：每次推上 main、開 PR、或手動執行時，用 ESP-IDF v6.1（esp32c6）建置，
+# 產生的燒錄檔放在該次執行的 Artifacts（保留 90 天）。推 v* 的 tag（例如 v0.4.0）時，另外建立 GitHub Release 附上燒錄檔。
+name: 韌體建置
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  host-test:
+    name: 喝水偵測單元測試
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: 編譯並執行 test/host
+        run: sh test/host/run.sh
+
+  build:
+    name: idf.py build（ESP-IDF v6.1、esp32c6）
+    runs-on: ubuntu-latest
+    needs: host-test
+    permissions:
+      contents: write   # 推 tag 時建立 Release 要用
+    steps:
+      - uses: actions/checkout@v7
+
+      # 在 espressif/idf:v6.1 容器裡建置；merge-bin 把 bootloader、分割表、程式合成一個從 0x0 開始的檔案
+      - name: 建置並產生單一燒錄檔
+        uses: espressif/esp-idf-ci-action@v1.2.0
+        with:
+          esp_idf_version: v6.1
+          target: esp32c6
+          command: idf.py build && idf.py merge-bin
+
+      - name: 整理燒錄檔
+        id: pack
+        run: |
+          set -eu
+          ver=$(awk '/^#define CUP_FW_(MAJOR|MINOR|PATCH)/ {printf "%s%s", sep, $3; sep="."}' main/ble_gatt_svr.h)
+          name="smart_cup_firmware-v${ver}-${GITHUB_SHA::7}"
+          mkdir -p dist
+          cp build/merged-binary.bin              "dist/${name}-merged.bin"
+          cp build/bootloader/bootloader.bin      dist/bootloader.bin
+          cp build/partition_table/partition-table.bin dist/partition-table.bin
+          cp build/smart_cup_test.bin             dist/smart_cup_test.bin
+          cp build/smart_cup_test.elf             dist/smart_cup_test.elf
+          # flash_args 裡的路徑改成和 dist 同一層，解壓後在資料夾裡直接 esptool write-flash @flash_args
+          sed -e 's#bootloader/##; s#partition_table/##' build/flash_args > dist/flash_args
+          cat > dist/燒錄說明.txt <<EOF
+          韌體 v${ver}（commit ${GITHUB_SHA::7}）ESP-IDF v6.1、esp32c6
+
+          A. 保留 flash 裡未確認的喝水事件（建議）：在這個資料夾執行
+             python -m esptool --chip esp32c6 -b 460800 write-flash @flash_args
+
+          B. 單一檔案（會清掉 NVS：未確認的喝水事件、boot_id 都會不見）：
+             python -m esptool --chip esp32c6 -b 460800 write-flash 0x0 ${name}-merged.bin
+
+          序列埠用 -p 指定：Linux /dev/ttyACM0、macOS /dev/cu.usbmodem*
+          smart_cup_test.elf 是除錯用（看 crash backtrace），不用燒
+          EOF
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          ls -la dist
+
+      - name: 上傳 Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: 建立 Release（只有推 v* tag 時）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true

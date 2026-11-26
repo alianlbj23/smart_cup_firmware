@@ -104,6 +104,29 @@ idf.py -p /dev/ttyACM0 flash monitor
 - 在 monitor 裡重開機、重跑開機測試：`Ctrl+T` 再按 `Ctrl+R`
 - 燒錄失敗、找不到板子時：按住 XIAO 的 **BOOT** 鍵，再按一下 **RESET**，放開 BOOT，就會進入下載模式，然後重新燒錄。燒完按一次 RESET。
 
+### 不裝 ESP-IDF：用 GitHub 自動建好的檔案燒錄
+
+每次推上 main、開 PR，GitHub Actions（[.github/workflows/build.yml](.github/workflows/build.yml)）都會先跑喝水偵測的單元測試，再用 ESP-IDF v6.1 建置 esp32c6 韌體。
+
+1. 到 GitHub 的 **Actions** 分頁 →「韌體建置」→ 點最新一次成功的執行，在最下面的 **Artifacts** 下載 `smart_cup_firmware-v<版本>-<commit>`（保留 90 天）。
+2. 解壓縮，裡面有 `燒錄說明.txt`。只需要 Python 的 esptool（`pip install esptool`），兩種燒法：
+
+```bash
+# A. 建議：分開燒 bootloader、分割表、程式，flash 裡未確認的喝水事件會保留
+python -m esptool --chip esp32c6 -p <序列埠> -b 460800 write-flash @flash_args
+
+# B. 單一檔案：從 0x0 整段蓋過去，中間的 NVS 區也會被清空（未確認的喝水事件、boot_id 會不見）
+python -m esptool --chip esp32c6 -p <序列埠> -b 460800 write-flash 0x0 smart_cup_firmware-v<版本>-<commit>-merged.bin
+```
+
+要發正式版本時推一個 `v` 開頭的 tag（版本號跟 `ble_gatt_svr.h` 的 `CUP_FW_*` 一致），會自動建立 GitHub Release 附上這些檔案：
+
+```bash
+git tag v0.4.0 && git push origin v0.4.0
+```
+
+GitHub 上建置失敗時（例如編譯警告，v6 會當成錯誤），Actions 分頁會顯示紅色叉叉，點進去看 log。
+
 ### 開機後會看到什麼
 
 1. 等 3 秒，讓 USB 重新連線。
@@ -533,5 +556,6 @@ tools/ble_check.py   用電腦模擬 App 測試 BLE（含 0x07 的 ACK；--no-ac
 test/host/           cup_state.c 事件偵測、Device Status 內容的單元測試，在電腦上跑（sh test/host/run.sh）
 tools/ble_watch.py   休眠測試：印出 BLE 廣播出現／消失的時間軸
 docs/wiring.pdf      接線圖、電極尺寸、接線順序
+.github/workflows/build.yml  GitHub Actions：單元測試 → ESP-IDF v6.1 建置 → 上傳燒錄檔（推 v* tag 時建立 Release）
 HANDOFF.md           開發交接筆記（ESP-IDF v6 注意事項、已踩過的坑）
 ```
