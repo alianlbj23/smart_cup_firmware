@@ -1,0 +1,4 @@
+# 開發用（跑測試、打包執行檔）：pip install -r tools/requirements-dev.txt
+-r requirements-cup-tool.txt
+pytest==9.2.0
+pyinstaller==6.22.3

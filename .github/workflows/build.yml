@@ -1,20 +1,22 @@
 # 自動建置：每次推上 main、開 PR、或手動執行時
-#   1. 喝水偵測單元測試
+#   1. 喝水偵測單元測試、校正工具 pytest
 #   2. 用 ESP-IDF v6.1（esp32c6）建置韌體 → Artifacts 放燒錄檔
-#   3. 把校正工具（tools/cup_tool.py）打包成 macOS App、Windows 執行檔 → Artifacts
-# 檔案放在該次執行的 Artifacts（保留 90 天）。推 v* 的 tag（例如 v0.5.0）時，另外建立 GitHub Release 附上全部檔案。
+#   3. 把校正工具（tools/cup_tool.py）打包成 macOS App、Windows 執行檔、Linux 執行檔 → Artifacts
+#   4. 發版：改 main/ble_gatt_svr.h 的 CUP_FW_* 版號推上 main，上面都通過後自動建 v<版號> tag 和 GitHub Release
+#      （韌體、三平台工具、SHA256SUMS.txt）；這個版號已發布過就跳過。只有推上 main 會發版
+# 檔案放在該次執行的 Artifacts（保留 90 天）。校正工具啟動時會查 GitHub 最新 Release，有新版就詢問並自動更新。
 name: 韌體建置
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: true
+  # main 不取消進行中的執行：發版做到一半被取消會留下不完整的 Release
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -25,17 +27,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
       - name: 編譯並執行 test/host
         run: sh test/host/run.sh
+      - name: 安裝校正工具套件
+        run: python -m pip install -r tools/requirements-dev.txt
       - name: 校正工具語法檢查
-        run: python3 -m py_compile tools/cup_tool.py
+        run: python -m py_compile tools/cup_tool.py tools/cup_updater.py
+      - name: 校正工具單元測試（pytest）
+        run: python -m pytest tools/tests -q
 
   build:
     name: idf.py build（ESP-IDF v6.1、esp32c6）
     runs-on: ubuntu-latest
     needs: host-test
-    permissions:
-      contents: write   # 推 tag 時建立 Release 要用
     steps:
       - uses: actions/checkout@v7
 
@@ -83,19 +90,10 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-      - name: 建立 Release（只有推 v* tag 時）
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: dist/*
-          generate_release_notes: true
-
   tool:
     name: 校正工具（${{ matrix.label }}）
     runs-on: ${{ matrix.os }}
     needs: host-test
-    permissions:
-      contents: write   # 推 tag 時附到 Release
     strategy:
       fail-fast: false
       matrix:
@@ -104,35 +102,134 @@ jobs:
             label: macOS
           - os: windows-latest
             label: Windows
+          - os: ubuntu-latest
+            label: Linux
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
       - name: 安裝套件
-        run: python -m pip install -r tools/requirements-cup-tool.txt pyinstaller
+        run: python -m pip install -r tools/requirements-dev.txt
+      # 工具版號 = 韌體版號，寫成 VERSION 包進執行檔（執行時從 sys._MEIPASS/VERSION 讀）
+      - name: 寫入 VERSION
+        shell: bash
+        run: |
+          set -eu
+          awk '/^#define CUP_FW_(MAJOR|MINOR|PATCH)/ {printf "%s%s", sep, $3; sep="."}' main/ble_gatt_svr.h > VERSION
+          cat VERSION
       - name: 打包（macOS）
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --noconfirm --windowed --name SmartCupTool --collect-data esptool tools/cup_tool.py
+          pyinstaller --noconfirm --windowed --name SmartCupTool --collect-data esptool --paths tools --add-data "VERSION:." tools/cup_tool.py
           dist/SmartCupTool.app/Contents/MacOS/SmartCupTool --self-test
           ditto -c -k --keepParent dist/SmartCupTool.app SmartCupTool-macOS.zip
       - name: 打包（Windows）
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name SmartCupTool --collect-data esptool tools/cup_tool.py
+          pyinstaller --noconfirm --onefile --windowed --name SmartCupTool --collect-data esptool --paths tools --add-data "VERSION:." tools/cup_tool.py
           $p = Start-Process dist/SmartCupTool.exe -ArgumentList '--self-test' -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "self-test 失敗（$($p.ExitCode)）" }
           Compress-Archive dist/SmartCupTool.exe SmartCupTool-Windows.zip
+      # Linux 沒有螢幕，self-test 用 xvfb 的虛擬螢幕跑
+      - name: 打包（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          pyinstaller --noconfirm --onefile --windowed --name SmartCupTool --collect-data esptool --paths tools --add-data "VERSION:." tools/cup_tool.py
+          xvfb-run -a dist/SmartCupTool --self-test
+          cd dist && zip ../SmartCupTool-Linux.zip SmartCupTool
       - name: 上傳 Artifacts
         uses: actions/upload-artifact@v7
         with:
           name: SmartCupTool-${{ matrix.label }}-${{ github.sha }}
           path: SmartCupTool-${{ matrix.label }}.zip
           if-no-files-found: error
-      - name: 附到 Release（只有推 v* tag 時）
-        if: startsWith(github.ref, 'refs/tags/v')
+
+  release:
+    name: 發版（版號改了才建 Release）
+    runs-on: ubuntu-latest
+    needs: [build, tool]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write   # 建 tag、Release
+    steps:
+      - uses: actions/checkout@v7
+
+      # 已經有「發布了、而且有 SHA256SUMS.txt」的 v<版號> Release = 版號沒改 → 跳過
+      # 只看 tag 不夠：上次發版失敗留下的 draft 或缺檔 Release，要能重跑補上
+      - name: 讀版號、檢查是否已發版
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          ver=$(awk '/^#define CUP_FW_(MAJOR|MINOR|PATCH)/ {printf "%s%s", sep, $3; sep="."}' main/ble_gatt_svr.h)
+          if [[ ! "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::讀不到版號（main/ble_gatt_svr.h 的 CUP_FW_MAJOR/MINOR/PATCH），讀到「${ver}」"
+            exit 1
+          fi
+          tag="v${ver}"
+          skip=false
+          rc=0
+          state=$(gh release view "$tag" --json isDraft,assets \
+                    --jq '"\(.isDraft) \(any(.assets[]; .name == "SHA256SUMS.txt"))"' 2> gh_err.txt) || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            if [ "$state" = "false true" ]; then
+              echo "::notice::${tag} 已經發過版（版號沒改），這次不建 Release"
+              skip=true
+            else
+              echo "::warning::${tag} 有未完成的 Release（draft 或缺 SHA256SUMS.txt：${state}），重新上傳並發布"
+            fi
+          elif grep -qi "release not found" gh_err.txt; then
+            echo "${tag} 還沒有 Release，建立新版"
+          else
+            echo "::error::查詢 Release 失敗（gh 結束碼 ${rc}）：$(cat gh_err.txt)"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "skip=${skip}" >> "$GITHUB_OUTPUT"
+
+      - name: 下載全部 Artifacts
+        if: steps.ver.outputs.skip != 'true'
+        uses: actions/download-artifact@v7
+        with:
+          path: release
+          merge-multiple: true
+
+      # 校正工具自動更新時用這個檔比對下載的 zip
+      - name: 產生 SHA256SUMS.txt
+        if: steps.ver.outputs.skip != 'true'
+        run: |
+          set -eu
+          cd release
+          sha256sum -- * > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          for f in SmartCupTool-macOS.zip SmartCupTool-Windows.zip SmartCupTool-Linux.zip; do
+            grep -q "  ${f}\$" SHA256SUMS.txt || { echo "::error::少了 ${f}"; exit 1; }
+          done
+
+      # 先建 draft（不會建 tag、工具也看不到），全部檔案上傳完才發布並設成 latest
+      - name: 上傳到 draft Release
+        if: steps.ver.outputs.skip != 'true'
         uses: softprops/action-gh-release@v3
         with:
-          files: SmartCupTool-${{ matrix.label }}.zip
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: release/*
+          generate_release_notes: true
+          draft: true
+          overwrite_files: true
+
+      - name: 發布 Release
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false --latest

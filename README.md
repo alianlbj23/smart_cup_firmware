@@ -106,7 +106,7 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 ### 不裝 ESP-IDF：用 GitHub 自動建好的檔案燒錄
 
-每次推上 main、開 PR，GitHub Actions（[.github/workflows/build.yml](.github/workflows/build.yml)）都會先跑喝水偵測的單元測試，再用 ESP-IDF v6.1 建置 esp32c6 韌體，並把校正工具打包成 macOS App 和 Windows 執行檔（見[第 4 節](#用校正工具建議韌體-050-起)）。**最簡單的燒法是用校正工具的「燒錄韌體」**，下面是不用工具的做法。
+每次推上 main、開 PR，GitHub Actions（[.github/workflows/build.yml](.github/workflows/build.yml)）都會先跑喝水偵測的單元測試，再用 ESP-IDF v6.1 建置 esp32c6 韌體，並把校正工具打包成 macOS App、Windows 和 Linux 執行檔（見[第 4 節](#用校正工具建議韌體-050-起)）。**最簡單的燒法是用校正工具的「燒錄韌體」**，下面是不用工具的做法。
 
 1. 到 GitHub 的 **Actions** 分頁 →「韌體建置」→ 點最新一次成功的執行，在最下面的 **Artifacts** 下載 `smart_cup_firmware-v<版本>-<commit>`（保留 90 天）。
 2. 解壓縮，裡面有 `燒錄說明.txt`。只需要 Python 的 esptool（`pip install esptool`），兩種燒法：
@@ -119,11 +119,7 @@ python -m esptool --chip esp32c6 -p <序列埠> -b 460800 write-flash @flash_arg
 python -m esptool --chip esp32c6 -p <序列埠> -b 460800 write-flash 0x0 smart_cup_firmware-v<版本>-<commit>-merged.bin
 ```
 
-要發正式版本時推一個 `v` 開頭的 tag（版本號跟 `ble_gatt_svr.h` 的 `CUP_FW_*` 一致），會自動建立 GitHub Release 附上這些檔案：
-
-```bash
-git tag v0.5.0 && git push origin v0.5.0
-```
+**發版**：改 `main/ble_gatt_svr.h` 的 `CUP_FW_MAJOR／MINOR／PATCH` 推上 main，單元測試、韌體建置、三平台工具打包都通過後，CI 會自動建 `v<版號>` tag 和 GitHub Release，附上韌體檔、三平台工具（`SmartCupTool-macOS.zip`、`SmartCupTool-Windows.zip`、`SmartCupTool-Linux.zip`）和 `SHA256SUMS.txt`。Release 先建成 draft，全部檔案上傳完才發布，所以工具不會看到缺檔的版本。這個版號已經有發布過、而且有 `SHA256SUMS.txt` 的 Release 就不發版，不用手動打 tag；上次發版中途失敗的話，在 Actions 按 Re-run 或再推一次 main 就會補上。只有推上 main 會發版（手動推 tag 不會觸發）。
 
 GitHub 上建置失敗時（例如編譯警告，v6 會當成錯誤），Actions 分頁會顯示紅色叉叉，點進去看 log。
 
@@ -210,13 +206,24 @@ MPR121 的充電時間設定在 [main/main.c](main/main.c)：
 
 **取得工具**（擇一）：
 
-- **不裝 Python**：GitHub 的 **Actions** 分頁 →「韌體建置」→ 最新一次成功的執行 → Artifacts 下載 `SmartCupTool-macOS-…` 或 `SmartCupTool-Windows-…`，解壓後雙擊。macOS 第一次開會說「無法驗證開發者」（沒有簽章）：在 Finder 對 App **按右鍵 →「打開」**，之後就能直接開。
-- **用 Python 跑**（Linux 用這個）：Python 要有 Tkinter（macOS 用 python.org 的安裝檔；Homebrew 的要 `brew install python-tk@3.13`；Linux 要 `sudo apt install python3-tk`）
+- **不裝 Python**：到 GitHub 最新的 **Release** 下載 `SmartCupTool-macOS.zip`（App）、`SmartCupTool-Windows.zip`（exe）或 `SmartCupTool-Linux.zip`（單一執行檔），解壓後雙擊／執行（還沒發版的 commit 在 **Actions** 分頁 → 該次執行的 Artifacts）。
+  - macOS：第一次開會說「無法驗證開發者」（沒有簽章）：在 Finder 對 App **按右鍵 →「打開」**，之後就能直接開。**先把 App 搬到「應用程式」資料夾**，直接從「下載」執行時無法自動更新。
+  - Linux：使用者要在 `dialout` 群組才能開序列埠（`sudo usermod -aG dialout $USER`，重新登入後生效）。執行檔在 GitHub 的 `ubuntu-latest`（Ubuntu 24.04）建置，需要 glibc 2.39 以上；更舊的發行版請從原始碼執行。
+- **用 Python 跑**：Python 要有 Tkinter（macOS 用 python.org 的安裝檔；Homebrew 的要 `brew install python-tk@3.13`；Linux 要 `sudo apt install python3-tk`）
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r tools/requirements-cup-tool.txt
 .venv/bin/python tools/cup_tool.py
+```
+
+**自動更新**：工具啟動時會查 GitHub 最新 Release，有新版會詢問，確認後下載、比對 `SHA256SUMS.txt`，換成新版並重新啟動（比對不符或沒有 `SHA256SUMS.txt` 就不更新）。連著水杯、燒錄或量測中時，自動檢查會等到閒置（沒連線）才問；手動按「檢查工具更新」則會提醒更新要中斷連線。Windows 更新後留下的 `SmartCupTool.exe.old`、macOS 的 `SmartCupTool.app.old` 會在下次啟動時自動刪掉。從原始碼執行時只在紀錄提示有新版（手動檢查才會問要不要打開 Release 網頁），不會更新自己。加 `--no-update-check` 參數可以關閉檢查。
+
+**開發**：改工具要跑測試，打包用的 PyInstaller 也在同一份清單：
+
+```bash
+.venv/bin/pip install -r tools/requirements-dev.txt
+.venv/bin/python -m pytest tools/tests
 ```
 
 **使用步驟**（先關掉 VS Code 的 monitor，同一個序列埠一次只能給一個程式用）：
@@ -586,10 +593,11 @@ main/CMakeLists.txt  用到的 ESP-IDF 元件（esp_driver_i2c、esp_driver_gpio
 sdkconfig.defaults   主控台走 USB Serial/JTAG、4MB Flash、NimBLE、電源管理（自動淺眠）
 tools/read_levels.py 校正用：錄一段電極讀值並算平均
 tools/cup_tool.py    校正工具（視窗程式）：量空杯／滿杯、寫入校正值、燒錄韌體；套件見 tools/requirements-cup-tool.txt
+tools/cup_updater.py 校正工具的自動更新（查 Release、下載、比對 SHA256SUMS.txt、替換）；測試在 tools/tests/（開發套件 tools/requirements-dev.txt）
 tools/ble_check.py   用電腦模擬 App 測試 BLE（含 0x07 的 ACK；--no-ack 測重送）
 test/host/           cup_state.c 事件偵測、Device Status 內容的單元測試，在電腦上跑（sh test/host/run.sh）
 tools/ble_watch.py   休眠測試：印出 BLE 廣播出現／消失的時間軸
 docs/wiring.pdf      接線圖、電極尺寸、接線順序
-.github/workflows/build.yml  GitHub Actions：單元測試 → ESP-IDF v6.1 建置韌體、打包校正工具（macOS／Windows）→ 上傳（推 v* tag 時建立 Release）
+.github/workflows/build.yml  GitHub Actions：單元測試 → ESP-IDF v6.1 建置韌體、打包校正工具（macOS／Windows／Linux）→ 上傳；版號改了推上 main 自動建 tag 和 Release
 HANDOFF.md           開發交接筆記（ESP-IDF v6 注意事項、已踩過的坑）
 ```

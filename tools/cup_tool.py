@@ -4,7 +4,7 @@
 
     python3 -m venv .venv
     .venv/bin/pip install -r tools/requirements-cup-tool.txt
-    .venv/bin/python tools/cup_tool.py
+    .venv/bin/python tools/cup_tool.py          # 加 --no-update-check 不檢查工具更新
 
 需要有 Tkinter 的 Python：macOS 用 python.org 的安裝檔（Homebrew 的要另外 brew install python-tk@3.13）、
 Linux 要 sudo apt install python3-tk、Windows 的官方安裝檔內建。
@@ -16,8 +16,11 @@ Linux 要 sudo apt install python3-tk、Windows 的官方安裝檔內建。
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
+import os
 import queue
+import subprocess
 import sys
 import tempfile
 import threading
@@ -25,6 +28,7 @@ import time
 import tkinter as tk
 import urllib.error
 import urllib.request
+import webbrowser
 import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -32,7 +36,9 @@ from tkinter import filedialog, messagebox, ttk
 import serial
 import serial.tools.list_ports
 
-GITHUB_REPO = "alianlbj23/smart_cup_firmware"
+import cup_updater as updater
+
+GITHUB_REPO = updater.GITHUB_REPO
 ESPRESSIF_VID = 0x303A
 MEASURE_MS = 5000
 KEEPALIVE_S = 20          # 水杯在最後一個指令 60 秒後恢復休眠，連著時每 20 秒 PING 一次
@@ -44,6 +50,11 @@ WARN_NOISE = 6            # 量測期間電極0 最大－最小超過這個值�
 WARN_STILL = 0.9          # 量測期間「直立靜止」的比例低於這個值：杯子沒放穩
 POSES = {"upright": "直立", "tilted": "傾斜", "drinking": "飲用中", "lying": "倒下", "unknown": "未知"}
 REPO_ROOT = Path(__file__).resolve().parent.parent
+FROZEN = bool(getattr(sys, "frozen", False))   # PyInstaller 打包後才會自我更新
+TOOL_VERSION = updater.current_version(Path(getattr(sys, "_MEIPASS", ".")) if FROZEN else None, REPO_ROOT)
+UPDATE_DELAY_MS = 2000    # 開視窗後多久自動檢查工具更新
+UPDATE_RETRY_MS = 5000    # 工具忙（燒錄、量測）或連線中時延後多久再問
+CLEANUP_DELAY_MS = 5000   # 更新後啟動多久再刪舊版的 .old
 
 
 def parse_kv(line: str) -> dict[str, str]:
@@ -278,13 +289,16 @@ def run_esptool(port: str, folder: Path, log):
 #  視窗
 # ============================================================================
 class App:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, auto_update_check: bool = True):
         self.root = root
-        root.title("智慧水杯 校正工具")
+        root.title(f"智慧水杯 校正工具 {TOOL_VERSION}")
+        self.opener = functools.partial(urllib.request.urlopen, context=ssl_context())
         root.minsize(760, 640)
         self.link: CupLink | None = None
         self.ui_q: queue.Queue = queue.Queue()
         self.busy = False
+        self.closing = False          # 視窗關掉後，佇列裡剩下的介面更新都不做
+        self.checking_update = False  # 同時只查一次，避免跳兩個更新對話框
         self.empty: dict | None = None
         self.full: dict | None = None
         self.device_cal: tuple[int, int] | None = None
@@ -294,6 +308,10 @@ class App:
         self.refresh_ports()
         root.after(50, self._pump)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if FROZEN:   # Windows 舊版的行程剛結束時 .old 可能還鎖著，等一下再刪
+            root.after(CLEANUP_DELAY_MS, self._cleanup_old_version)
+        if auto_update_check:
+            root.after(UPDATE_DELAY_MS, lambda: self.check_update(auto=True))
 
     # ---------------- 介面 ----------------
     def _build(self):
@@ -306,6 +324,8 @@ class App:
         ttk.Button(top, text="重新整理", command=self.refresh_ports).grid(row=0, column=1, padx=4)
         self.conn_btn = ttk.Button(top, text="連線", command=self.toggle_connect)
         self.conn_btn.grid(row=0, column=2, padx=4)
+        self.update_btn = ttk.Button(top, text="檢查工具更新", command=lambda: self.check_update(auto=False))
+        self.update_btn.grid(row=0, column=3, padx=4)
         self.status_var = tk.StringVar(value="還沒連線。VS Code 的 monitor 要先關掉。")
         ttk.Label(top, textvariable=self.status_var).grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
 
@@ -375,6 +395,7 @@ class App:
         for b in (self.fw_btn_release, self.fw_btn_file, self.fw_btn_build):
             b.state(["!disabled"] if not self.busy and self.port_var.get() else ["disabled"])
         self.conn_btn.state(["disabled"] if self.busy else ["!disabled"])
+        self.update_btn.state(["disabled"] if self.busy else ["!disabled"])
         self.conn_btn.configure(text="中斷連線" if self.link else "連線")
 
     # ---------------- 執行緒 → 介面 ----------------
@@ -392,11 +413,13 @@ class App:
 
     def _pump(self):
         try:
-            while True:
+            while not self.closing:
                 fn, args = self.ui_q.get_nowait()
                 fn(*args)
         except queue.Empty:
             pass
+        if self.closing:
+            return
         # 連著時定期 PING，水杯才不會回去休眠
         if self.link and not self.busy and time.time() - self.last_ping > KEEPALIVE_S:
             self.last_ping = time.time()
@@ -430,7 +453,8 @@ class App:
 
     def _done(self):
         self.busy = False
-        self._update_buttons()
+        if not self.closing:
+            self._update_buttons()
 
     # ---------------- 連線 ----------------
     def refresh_ports(self):
@@ -657,7 +681,100 @@ class App:
         self.refresh_ports()
         self.toggle_connect()
 
+    # ---------------- 工具自我更新（cup_updater.py） ----------------
+    def _cleanup_old_version(self):
+        """上次更新留下的 .old（Windows 執行中的 exe 只能改名，要等下次啟動才刪得掉）"""
+        try:
+            updater.cleanup_old(updater.install_target(Path(sys.executable), sys.platform))
+        except (OSError, updater.UpdateError) as e:
+            self.log(f"[更新] 清理舊版失敗（不影響使用）：{e}")
+
+    def check_update(self, auto: bool):
+        if self.checking_update:
+            return
+        if self.busy:
+            if auto:
+                self.root.after(UPDATE_RETRY_MS, lambda: self.check_update(auto=True))
+            return
+        self.checking_update = True
+        threading.Thread(target=self._check_update_thread, args=(auto,), daemon=True).start()
+
+    def _check_update_thread(self, auto: bool):
+        """背景執行緒：任何例外都記下來（打包成 --windowed 後沒有 stderr，不接住就無聲無息）"""
+        try:
+            self._check_update(auto)
+        except Exception as e:   # 不預期的錯誤也要讓使用者看到
+            self.log(f"[更新] 檢查工具更新發生錯誤：{e!r}")
+            if not auto:
+                self.ui(messagebox.showerror, "智慧水杯", f"檢查工具更新發生錯誤：{e!r}")
+        finally:
+            self.ui(self._check_finished)
+
+    def _check_finished(self):
+        self.checking_update = False
+
+    def _check_update(self, auto: bool):
+        if TOOL_VERSION == updater.DEV:
+            self.log("[更新] 版號是 dev（讀不到 VERSION 或 main/ble_gatt_svr.h），不檢查更新")
+            return
+        try:
+            u = updater.latest_update(TOOL_VERSION, sys.platform, self.opener)
+        except updater.UpdateError as e:
+            self.log(f"[更新] 檢查工具更新失敗：{e}")
+            if not auto:
+                self.ui(messagebox.showerror, "智慧水杯", f"檢查工具更新失敗：{e}")
+            return
+        if u is None:
+            self.log(f"[更新] 工具 {TOOL_VERSION} 已經是最新版")
+            if not auto:
+                self.ui(messagebox.showinfo, "智慧水杯", f"工具 {TOOL_VERSION} 已經是最新版。")
+            return
+        self.log(f"[更新] 發現新版 {u.version}（目前 {TOOL_VERSION}）：{u.page_url}")
+        if not FROZEN and auto:   # 從原始碼執行：自動檢查只記在紀錄，不跳視窗
+            self.log("[更新] 從原始碼執行不會自動更新，git pull 即可")
+            return
+        self.ui(self._offer_update, u, auto)
+
+    def _offer_update(self, u: updater.Update, auto: bool):
+        # 燒錄、量測中一律延後；自動檢查連線中也延後（不打斷校正，沒寫入的量測值會不見）
+        if self.busy or (auto and self.link):
+            self.root.after(UPDATE_RETRY_MS, lambda: self._offer_update(u, auto))
+            return
+        if not FROZEN:
+            if messagebox.askyesno("智慧水杯", f"有新版工具 {u.version}（目前 {TOOL_VERSION}）。\n\n"
+                                              "從原始碼執行不會自動更新（git pull 即可）。要打開 Release 網頁嗎？"):
+                webbrowser.open(u.page_url)
+            return
+        msg = (f"有新版工具 {u.version}（目前 {TOOL_VERSION}），要現在更新嗎？\n\n"
+               "會下載新版、比對檔案雜湊，換好後自動重新啟動。")
+        if self.link:
+            msg += "\n\n注意：會中斷和水杯的連線，還沒按「寫入水杯」的量測值會消失。"
+        if not messagebox.askyesno("智慧水杯", msg):
+            return
+        if self.link:
+            self._disconnected("更新工具前先中斷連線")
+        self.background(self._apply_update, u)
+
+    def _apply_update(self, u: updater.Update):
+        try:
+            target = updater.install_target(Path(sys.executable), sys.platform)
+            updater.apply_update(u, sys.platform, target, self.opener, log=self.log)
+        except updater.UpdateError as e:
+            raise CupError(f"{e}\n\n也可以到 {u.page_url} 手動下載。") from e
+        self.log(f"[更新] 已換成 {u.version}，重新啟動")
+        self.ui(self._restart, target)
+
+    def _restart(self, target: Path):
+        try:
+            subprocess.Popen(updater.restart_command(sys.platform, target), env=updater.restart_env(os.environ))
+        except OSError as e:
+            self.log(f"[更新] 重新啟動失敗：{e}")
+            messagebox.showerror("智慧水杯", f"已經更新，但重新啟動失敗（{e}），請手動打開 {target}")
+            return
+        self.on_close()
+
     def on_close(self):
+        self.closing = True
         if self.link:
             self.link.close()
         self.root.destroy()
@@ -670,12 +787,16 @@ def self_test() -> int:
     if not stub.exists():
         print(f"缺少 {stub}（PyInstaller 要加 --collect-data esptool）")
         return 1
+    if FROZEN and TOOL_VERSION == updater.DEV:
+        print("打包後讀不到 VERSION（PyInstaller 要加 --add-data VERSION:.），自動更新會失效")
+        return 1
+    updater.asset_name(sys.platform)   # 這個平台要有對應的 Release 檔名
     root = tk.Tk()
     root.withdraw()
-    App(root)
+    App(root, auto_update_check=False)
     root.update()
     root.destroy()
-    print(f"self-test OK：esptool {esptool.__version__}、序列埠 {len(list_ports())} 個")
+    print(f"self-test OK：工具 {TOOL_VERSION}、esptool {esptool.__version__}、序列埠 {len(list_ports())} 個")
     return 0
 
 
@@ -686,7 +807,7 @@ def main():
     if sys.platform.startswith("linux"):   # Linux 預設主題太舊，換 clam
         with contextlib.suppress(tk.TclError):
             ttk.Style().theme_use("clam")
-    App(root)
+    App(root, auto_update_check="--no-update-check" not in sys.argv)
     root.mainloop()
 
 
