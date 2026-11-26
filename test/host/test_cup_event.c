@@ -230,18 +230,45 @@ static void t_noise(void)
     CHECK(s_n_events == 0);
 }
 
+#ifndef TEST_STATIC_DISABLED
+// 所有加水事件的量加起來(%)
+static float refill_total(void)
+{
+    float sum = 0;
+    for (int i = 0; i < s_n_events && i < 16; i++) {
+        if (s_events[i].kind == CUP_EVT_REFILL) {
+            sum += s_events[i].after_pct - s_events[i].before_pct;
+        }
+    }
+    return sum;
+}
+#endif
+
 static void t_static_drift(void)
 {
-    printf("杯子不動時倒水進去 → 只更新基準\n");
     reset_all();
     put_down(30, 5000);
     for (int i = 0; i <= 50; i++) {
         put_down(30 + i, 200);
     }
-    put_down(80, 3000);
-    CHECK(s_n_events == 0);
+    put_down(80, 12000);
     float b;
     CHECK(cup_event_baseline(&b) && near(b, 80));
+#ifdef TEST_STATIC_DISABLED
+    printf("杯子不動時倒水進去 → 只更新基準(直立不動的規則關掉時)\n");
+    CHECK(s_n_events == 0);
+#else
+    printf("杯子不動時慢慢倒水進去(10 秒)→ 拆成前後相接的加水事件,加起來等於實際加的量\n");
+    CHECK(s_n_events >= 1);
+    for (int i = 0; i < s_n_events && i < 16; i++) {
+        CHECK(s_events[i].kind == CUP_EVT_REFILL && s_events[i].stationary);
+        if (i > 0) {
+            CHECK(near(s_events[i].before_pct, s_events[i - 1].after_pct));
+        }
+    }
+    CHECK(near(s_events[0].before_pct, 30));
+    CHECK(near(refill_total(), 50));
+#endif
 }
 
 static void t_too_long(void)
@@ -622,23 +649,150 @@ static void t_static_small_sips(void)
 
 static void t_static_rise(void)
 {
-    printf("直立不動上升 → 只更新基準；之後的下降和新的基準比\n");
+    printf("直立不動時倒水進去 → 持續 8 秒後記一筆加水;之後的下降和新的基準比\n");
     reset_all();
     put_down(30, 5000);
-    put_down(45, 20000);
-    CHECK(s_n_events == 0 && baseline_is(45));
+    uint32_t poured_at = s_now;
+    put_down(45, STATIC_HOLD_MS - 200);
+    CHECK(s_n_events == 0 && baseline_is(45));   // 還沒持續夠久;基準照舊馬上跟上去
+    put_down(45, 400);
+    CHECK(s_n_events == 1);
+    cup_event_t *e = &s_events[0];
+    CHECK(e->kind == CUP_EVT_REFILL && e->stationary && !e->saw_drinking && !e->too_long);
+    CHECK(near(e->before_pct, 30) && near(e->after_pct, 45));
+    CHECK(e->start_ms == poured_at);
+    put_down(45, 60000);
+    CHECK(s_n_events == 1 && baseline_is(45));   // 同一次加水只記一筆
     put_down(41, STATIC_HOLD_MS + 100);
-    CHECK(s_n_events == 1 && s_events[0].kind == CUP_EVT_DRINK);
-    CHECK(near(s_events[0].before_pct, 45) && near(s_events[0].after_pct, 41));
+    CHECK(s_n_events == 2 && s_events[1].kind == CUP_EVT_DRINK);
+    CHECK(near(s_events[1].before_pct, 45) && near(s_events[1].after_pct, 41));
 
-    printf("小口喝了 2%%（還沒到門檻）之後有人倒水進去 → 基準跟上去，不產生事件\n");
+    printf("小口喝了 2%%（還沒到門檻）之後有人倒水進去 → 加水從原本的基準算起\n");
     reset_all();
     put_down(60, 5000);
     put_down(58, 20000);
     put_down(70, 20000);
-    CHECK(s_n_events == 0 && baseline_is(70));
+    CHECK(s_n_events == 1 && s_events[0].kind == CUP_EVT_REFILL && baseline_is(70));
+    CHECK(near(s_events[0].before_pct, 60) && near(s_events[0].after_pct, 70));
     put_down(68, 60000);
-    CHECK(s_n_events == 0 && baseline_is(70));
+    CHECK(s_n_events == 1 && baseline_is(70));
+}
+
+static void t_static_refill(void)
+{
+    printf("加水不到 3%% → 不記\n");
+    reset_all();
+    put_down(50, 5000);
+    put_down(52.5f, 60000);
+    CHECK(s_n_events == 0 && baseline_is(52.5f));
+
+    printf("讀值上下跳(±1.5%%)很久 → 不會被當成加水\n");
+    reset_all();
+    put_down(50, 5000);
+    for (int i = 0; i < 600; i++) {
+        put_down(50 + (i % 3 == 0 ? 1.5f : i % 3 == 1 ? -1.5f : 0.0f), 500);
+    }
+    CHECK(s_n_events == 0);
+
+    printf("讀值慢慢往上漂(每分鐘 0.5%%,10 分鐘共 5%%)→ 不會被當成加水\n");
+    reset_all();
+    put_down(50, 5000);
+    for (int i = 1; i <= 10; i++) {
+        put_down(50 + 0.5f * i, 60000);
+    }
+    CHECK(s_n_events == 0 && baseline_is(55));
+
+    printf("水位衝高不到 8 秒又回來(有人碰到感應區)→ 不記\n");
+    reset_all();
+    put_down(50, 5000);
+    put_down(60, 3000);
+    put_down(50, 60000);
+    CHECK(refill_total() == 0);
+
+    printf("倒完水 3 秒就拿起來喝一口(還沒滿 8 秒)→ 拿起時補記加水,喝的那一口照常另外記,不互相抵銷\n");
+    reset_all();
+    put_down(30, 5000);
+    uint32_t poured = s_now;
+    put_down(45, 3000);
+    CHECK(s_n_events == 0);
+    sip(45);
+    CHECK(s_n_events == 1 && s_events[0].kind == CUP_EVT_REFILL && s_events[0].stationary);
+    CHECK(near(s_events[0].before_pct, 30) && near(s_events[0].after_pct, 45));
+    CHECK(s_events[0].start_ms == poured);
+    put_down(41, 5000);
+    CHECK(s_n_events == 2 && s_events[1].kind == CUP_EVT_DRINK && s_events[1].saw_drinking);
+    CHECK(near(s_events[1].before_pct, 45) && near(s_events[1].after_pct, 41));
+    put_down(41, 60000);
+    CHECK(s_n_events == 2);
+
+    printf("水位跳高不到 2 秒杯子就被拿起(手碰到感應區)→ 不會被當成加水\n");
+    reset_all();
+    put_down(50, 5000);
+    put_down(56, 1000);
+    sip(56);
+    put_down(50, 5000);
+    CHECK(refill_total() == 0);
+
+    printf("倒水進去之後馬上用吸管喝 → 加水記到最高的水位,喝水另外記一筆,兩筆相接\n");
+    reset_all();
+    put_down(30, 5000);
+    put_down(45, 3000);
+    put_down(41, 30000);
+    CHECK(s_n_events == 2);
+    CHECK(s_events[0].kind == CUP_EVT_REFILL);
+    CHECK(near(s_events[0].before_pct, 30) && near(s_events[0].after_pct, 45));
+    CHECK(s_events[1].kind == CUP_EVT_DRINK);
+    CHECK(near(s_events[1].before_pct, 45) && near(s_events[1].after_pct, 41));
+
+    printf("休眠中倒水進去 → 連續 3 筆(約 10 秒)後記一筆加水\n");
+    reset_all();
+    put_down(30, 5000);
+    doze_sample(30);
+    doze_sample(50);
+    doze_sample(50);
+    CHECK(s_n_events == 0);
+    doze_sample(50);
+    CHECK(s_n_events == 1 && s_events[0].kind == CUP_EVT_REFILL && s_events[0].stationary);
+    CHECK(near(s_events[0].before_pct, 30) && near(s_events[0].after_pct, 50));
+    doze_sample(50);
+    doze_sample(50);
+    CHECK(s_n_events == 1);
+
+    printf("休眠中倒水進去、量到 2 筆之後被拿起來(還沒滿 3 筆)→ 喚醒時補記加水\n");
+    reset_all();
+    put_down(30, 5000);
+    doze_sample(30);
+    doze_sample(50);
+    doze_sample(50);
+    CHECK(s_n_events == 0);
+    cup_event_wake(s_now);
+    run(CUP_POSE_UPRIGHT, true, 50, 1000);
+    CHECK(s_n_events == 1 && s_events[0].kind == CUP_EVT_REFILL);
+    CHECK(near(s_events[0].before_pct, 30) && near(s_events[0].after_pct, 50));
+    put_down(50, 5000);
+    CHECK(s_n_events == 1);
+
+    printf("休眠中喚醒後杯子馬上又直立靜止 → 補記的加水照樣送出\n");
+    reset_all();
+    put_down(30, 5000);
+    doze_sample(30);
+    doze_sample(50);
+    doze_sample(50);
+    cup_event_wake(s_now);
+    put_down(50, 5000);
+    CHECK(s_n_events == 1 && s_events[0].kind == CUP_EVT_REFILL);
+    CHECK(near(s_events[0].before_pct, 30) && near(s_events[0].after_pct, 50));
+
+    printf("休眠中只量到 1 筆就被拿起來 → 來不及確認,不記加水;之後喝的照常從倒完的水位算\n");
+    reset_all();
+    put_down(30, 5000);
+    doze_sample(30);
+    doze_sample(50);
+    cup_event_wake(s_now);
+    sip(50);
+    put_down(45, 5000);
+    CHECK(s_n_events == 1 && s_events[0].kind == CUP_EVT_DRINK);
+    CHECK(near(s_events[0].before_pct, 50) && near(s_events[0].after_pct, 45));
 }
 
 static void t_static_and_lift(void)
@@ -889,6 +1043,7 @@ int main(void)
     t_static_with_noise();
     t_static_small_sips();
     t_static_rise();
+    t_static_refill();
     t_static_and_lift();
     t_doze_static();
     t_small_drop_accumulate();

@@ -104,7 +104,7 @@ typedef struct {
     float after_pct;      // 放回穩定後的水位 B（%）；直立不動的事件 = 確認當下的水位
     bool saw_drinking;    // 過程中出現過「飲用中」姿態（直立不動的事件一定是 false）
     bool too_long;        // 過程超過 EVT_MAX_EPISODE_MS
-    bool stationary;      // 這筆是「直立不動時水位下降」產生的（只給序列埠顯示用，不會送給 App）
+    bool stationary;      // 這筆是「直立不動時水位下降／上升」產生的（只給序列埠顯示用，不會送給 App）
     uint32_t start_ms;    // 過程開始（離開穩定）的時間，和呼叫端傳入的 now_ms 同一個時鐘。
                           // 直立不動的事件 = 水位開始「連續低於基準 ≥ 門檻」的那一筆的時間
     uint32_t end_ms;      // 重新穩定的時間；直立不動的事件 = 確認（產生事件）的時間
